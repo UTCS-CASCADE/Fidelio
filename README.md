@@ -1,0 +1,95 @@
+# Fidelio
+
+Benchmark Generation system as seen in "Fidelio: Agentic AI Framework for Synthesizing Microarchitecture-Faithful Datacenter Benchmarks"  The workflow profiles a workload, selects an editable
+microbenchmark by IPC, retrieves editing context, generates and compiles changes,
+measures candidates against the target counters, and stitches segment results.
+
+## dependencies
+
+
+```bash
+git init # Only if Fidelio is not already a Git repository.
+./bootstrap_folly_edit_rag.sh
+# folloeing clones: git submodule update --init --recursive
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt -r folly_edit_rag/requirements.txt
+export PYTHON=python3
+export SEG08_PERPROC=1
+export DC_PERF_ROOT=/path/to/DCPerf
+export CMAKE_BUILD_DIR="$DC_PERF_ROOT/benchmarks/wdl_bench/wdl_build/build/folly_rag"
+```
+
+DCPerf/WDL supplies editable Folly/fbthrift sources, build dependencies and seed
+binaries; it is external to this extraction. Linux perf, C/C++ build tools and
+Intel XED (for Intel PT decoding) are also external prerequisites. Choose a perf
+build supporting your CPU's events; `TMA_PERF_BIN` can override the TMA collector.
+The setup script retains the upstream installers, but no system installation,
+benchmark build, privileged recording, or paid LLM request was run on import.
+
+## Prepare seed measurements and editing context
+
+With WDL and the Python dependencies installed:
+
+```bash
+python3 folly_edit_rag/scripts/01_prepare_folly_rag.py
+sudo -v
+python3 run_feature_extraction_end_to_end.py \
+  --binaries-dir "$CMAKE_BUILD_DIR" \
+  --output-xlsx "$PWD/search_engine/all_features.xlsx"
+export FEATURE_TABLE_XLSX="$PWD/search_engine/all_features.xlsx"
+python3 search_engine/build_scann.py
+python3 folly_edit_rag/scripts/07_generate_property_edit_tasks.py \
+  generate --output "$PWD/folly_edit_rag/data/property_edit_tasks/property_edit_tasks.jsonl"
+```
+
+The seed table must refer to binaries and editable sources on this machine.
+The extractor also accepts `--commands-manifest` for command-based seeds.
+`--amd` skips Intel PT in seed measurement; use `CLOUD_SKIP_INTEL_PT=1` for
+workload collection when Intel PT is unavailable.
+
+## Generate a benchmark
+
+Configure one supported LLM provider and its credentials (Vertex, Bedrock, or
+the local Copilot API proxy). For example, with Vertex credentials configured:
+
+```bash
+export LLM_PROVIDER=vertex
+export VERTEX_PROJECT_ID=your-project
+sudo -v
+./run_cloud_tuning_e2e.sh \
+  --output-dir "$PWD/outputs/my_workload" \
+  --benchmark-name my_workload \
+  --cloud-total-seconds 10 --cloud-segment-seconds 3 \
+  -- /path/to/workload arg1
+```
+
+Use `--input-cloud-json /path/to/workload_feature_extraction.json` to reuse a
+recording instead of providing a command. Results include the feature JSON,
+segment replacement plan with accuracy report, generated sources under
+`stitched/`, and service logs. IPC is the primary seed-selection signal;
+`CLONE_PRIORITY_MODE=backend` selects the backend counter priority profile.
+
+For recording alone:
+
+```bash
+python3 feature_extraction_engine/run_feature_extraction.py \
+  --cloud-mode --cloud-total-seconds 10 --cloud-segment-seconds 3 \
+  --output-dir outputs/profile --benchmark-name workload \
+  --cmd /path/to/workload
+```
+
+Run `--help` on the setup and successful-edit scripts for optional setup and
+corpus-building stages. The setup script expects a measured seed table before
+building the search index. Fidelio's search indexes and outputs stay local to
+this directory; it does not create compatibility links to BenchmarkReplication.
+
+## Validation
+
+```bash
+python3 -m unittest discover -s tests -v
+python3 -m unittest discover -s feature_extraction_engine -p 'test_*.py' -v
+```
+
+Tuning tests require the folly_edit_rag dependency. Full generation
+also requires PMU access, a built seed corpus, and provider credentials.

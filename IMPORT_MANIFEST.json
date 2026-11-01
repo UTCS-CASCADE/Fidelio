@@ -1,0 +1,37 @@
+{
+  "source": "/users/alanuiuc/BenchmarkReplication",
+  "commit": "aad51bb2c84f7ed17c47b28bb600686e4546ba58",
+  "files": [
+    "benchmark_sources.py",
+    "cloning_priority.py",
+    "cloud_segment_frontend.py",
+    "cloud_tuning.py",
+    "diagnostician.py",
+    "feature_prompt_guidance.py",
+    "feature_schema.py",
+    "run_feature_extraction_end_to_end.py",
+    "run_cloud_tuning_e2e.sh",
+    "run_full_successful_edit_database.sh",
+    "setup_and_run_complete_pipeline.sh",
+    "stitch_segments.py",
+    "agents/adjustor.py",
+    "feature_extraction_engine/run_feature_extraction.py",
+    "feature_extraction_engine/run_detailed_perf_benchmarks.py",
+    "feature_extraction_engine/run_intel_pt_record.py",
+    "feature_extraction_engine/run_perfspect_metrics.py",
+    "feature_extraction_engine/frequencies.py",
+    "feature_extraction_engine/_hot_pid_resolver.py",
+    "search_engine/build_scann.py",
+    "search_engine/input_to_search_delta.py",
+    "tests/test_feature_schema.py",
+    "tests/test_feature_extraction_manifest.py",
+    "tests/test_cloud_tuning_ipc.py",
+    "tests/test_cloud_tuning_cost.py",
+    "feature_extraction_engine/test_hot_pid_resolver.py"
+  ],
+  "folly_edit_rag": {
+    "url": "https://github.com/Alan-S-Andrade/folly_edit_rag.git",
+    "commit": "3bfe2c7c07069260786752fdd43cc355eb33187b",
+    "status": "Submodule declared in .gitmodules; gitlink registration and fetch pending because Fidelio .git is read-only and uninitialized. Run bootstrap_folly_edit_rag.sh after initializing a writable Git repository."
+  }
+}

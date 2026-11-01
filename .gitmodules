@@ -1,0 +1,3 @@
+[submodule "folly_edit_rag"]
+	path = folly_edit_rag
+	url = https://github.com/Alan-S-Andrade/folly_edit_rag.git

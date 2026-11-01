@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.env
+outputs/
+feature_extraction_outputs/
+search_engine/scann_index/
+search_engine/search_outputs/
+search_engine/*.xlsx
+*.log
+perf.data*

@@ -1,0 +1,9 @@
+# LLM/retrieval dependencies additionally come from folly_edit_rag/requirements.txt.
+numpy
+pandas
+openpyxl
+flask
+requests
+psutil
+scann
+boto3
