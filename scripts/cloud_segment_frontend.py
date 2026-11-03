@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""
-Frontend driver for cloud multi-segment feature JSONs.
-
-For each segment in a cloud feature JSON, this script sends the segment metrics to
-the search service (input_to_search_delta.py -> /search). The search service then
-routes through adjustor.py and the Folly edit/compile pipeline when needed.
-"""
+'Frontend driver for cloud multi-segment feature JSONs.'
 
 import argparse
 import json
@@ -21,7 +15,10 @@ from typing import Dict, Tuple, Any
 import requests
 import pandas as pd
 
-from feature_schema import (
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
+from scripts.feature_schema import (
     CANONICAL_FEATURE_COLUMNS,
     absolute_match_report,
     canonicalize_feature_dict,
@@ -29,11 +26,10 @@ from feature_schema import (
     load_feature_table,
     resolve_feature_table_path,
 )
-from run_feature_extraction_end_to_end import measure_unit_runtime
+from scripts.run_feature_extraction_end_to_end import measure_unit_runtime
 
 
 SEGMENT_KEY_RE = re.compile(r"^segment_(\d+)$")
-REPO_ROOT = Path(__file__).resolve().parent
 DEFAULT_XLSX = resolve_feature_table_path(REPO_ROOT / "search_engine" / "all_features.xlsx")
 AXIS_FEATURES = {
     "overall": tuple(CANONICAL_FEATURE_COLUMNS),
@@ -48,12 +44,6 @@ AXIS_FEATURES = {
 STOP_POLICY_AXIS = "hw_counters"
 DEFAULT_SEARCH_TIMEOUT_SECONDS = 10800.0
 
-# ── Axis importance weights for the final aggregate accuracy ────────────────
-# IPC and TMA are the most actionable and reliably captured axes.  hw_counters
-# (cache/TLB MPKI) are harder to steer and sw_metrics (intel_pt instruction-
-# stream dynamics) are extremely difficult to control via code generation.
-# Weights are used only for the weighted-axis aggregate; per-axis scores are
-# still reported independently.
 AXIS_IMPORTANCE_WEIGHTS: Dict[str, float] = {
     "ipc":                   0.30,
     "tma_metrics":           0.25,
@@ -101,11 +91,7 @@ def estimate_llm_cost(
     output_tokens: int,
     provider: str | None = None,
 ) -> float:
-    """Estimate USD cost for a given token count.
-
-    *provider* should be ``"vertex"`` (Gemini) or ``"bedrock"``
-    (Claude Sonnet 4.6).  Falls back to ``LLM_PROVIDER`` env var.
-    """
+    'Estimate USD cost for a given token count.'
     if provider is None:
         provider = _detect_llm_provider()
     pricing = _PRICING_TABLE.get(provider, _VERTEX_GEMINI_PRICING)
@@ -195,26 +181,6 @@ def _float_or_none(value: Any) -> float | None:
     if not math.isfinite(out):
         return None
     return out
-
-
-def weighted_accuracy_pct(axis_rows: Dict[str, dict], value_key: str, weights: Dict[str, float]) -> float | None:
-    numer = 0.0
-    denom = 0.0
-    for axis_name, weight in weights.items():
-        axis_row = axis_rows.get(axis_name, {})
-        if not isinstance(axis_row, dict):
-            continue
-        value = axis_row.get(value_key)
-        if not isinstance(value, (int, float)):
-            continue
-        value_f = float(value)
-        if not math.isfinite(value_f):
-            continue
-        numer += value_f * float(weight)
-        denom += float(weight)
-    if denom <= 0:
-        return None
-    return numer / denom
 
 
 def axis_accuracy_pct(axis_rows: Dict[str, dict], axis_name: str, value_key: str) -> float | None:
@@ -423,9 +389,6 @@ def summarize_accuracy(segment_results: Dict[str, dict], feature_scales: Dict[st
         "mean_profile_accuracy_pct",
     )
 
-    # ── Weighted-axis aggregate: combines per-axis accuracies using
-    #    AXIS_IMPORTANCE_WEIGHTS so that reliably-matchable axes (IPC, TMA)
-    #    are not zeroed out by harder-to-control axes (sw_metrics).
     weighted_axis_numer = 0.0
     weighted_axis_denom = 0.0
     for ax_name, ax_weight in AXIS_IMPORTANCE_WEIGHTS.items():
@@ -494,7 +457,7 @@ def print_accuracy_report(report: dict) -> None:
     )
 
 
-_LLM_OUTPUTS_DIR = Path(__file__).resolve().parent / "folly_edit_rag" / "scripts" / "outputs"
+_LLM_OUTPUTS_DIR = REPO_ROOT / "folly_edit_rag" / "scripts" / "outputs"
 
 
 def _sidecar_token_usage(run_prefix: str, segment_key: str) -> dict[str, int]:
@@ -592,7 +555,6 @@ def summarize_inference_stats(
         total_llm_call_count += stats["llm_call_count"]
     total_llm_calls = total_generation_calls + total_compile_repair_calls
 
-    # ── Cost estimation ─────────────────────────────────────────────────
     provider = _detect_llm_provider()
     # In tournament mode, estimate cost for each provider separately
     tournament_providers_env = os.environ.get("CLOUD_TOURNAMENT_PROVIDERS", "")
@@ -656,7 +618,7 @@ def _print_timing_and_inference_summary(
     inference_stats: dict,
 ) -> None:
     """Print timing and inference cost summary to stdout."""
-    print(f"\nTiming & inference summary:")
+    print("\nTiming & inference summary:")
     print(f"  Total pipeline elapsed time: {_format_duration(pipeline_elapsed_s)}")
 
     # Per-segment timing
@@ -688,7 +650,7 @@ def _print_timing_and_inference_summary(
     total_output_tok = inference_stats.get("total_output_tokens", 0)
     total_tok = inference_stats.get("total_tokens", 0)
     total_llm_count = inference_stats.get("total_llm_call_count", 0)
-    print(f"\n  Totals:")
+    print("\n  Totals:")
     print(f"    LLM generation calls:     {total_gen}")
     print(f"    LLM compile/repair calls: {total_repair}")
     print(f"    Total LLM calls:          {total_llm}")
@@ -700,12 +662,11 @@ def _print_timing_and_inference_summary(
     print(f"    Output tokens:            {total_output_tok:,}")
     print(f"    Total tokens:             {total_tok:,}")
 
-    # ── Cost estimate ───────────────────────────────────────────────────
     estimated_cost = inference_stats.get("estimated_cost_usd", 0.0)
     cost_by_provider = inference_stats.get("cost_by_provider") or {}
     providers_used = inference_stats.get("providers_used") or []
     if estimated_cost > 0 or total_tok > 0:
-        print(f"\n  Estimated LLM cost:")
+        print("\n  Estimated LLM cost:")
         for prov in providers_used:
             prov_cost = cost_by_provider.get(prov, 0.0)
             pricing = _PRICING_TABLE.get(prov, {})
@@ -847,9 +808,6 @@ def process_segment(
             if nearest_binary_path and chosen_microbenchmark:
                 runtime_estimate = measure_unit_runtime(Path(str(nearest_binary_path)), chosen_microbenchmark)
         elif isinstance(adjustor_resp, dict):
-            # Persist the measured best-candidate features even when the
-            # adjustor misses its acceptance threshold. Downstream reporting
-            # already labels these as unvalidated when adjustor_success=False.
             best_candidate = adjustor_resp.get("best_candidate") or {}
             chosen_features = canonicalize_feature_dict(best_candidate.get("features") or {})
             if not chosen_features:
@@ -1133,7 +1091,6 @@ def main() -> int:
             return 1
 
     for seg_idx, (seg_key, seg) in enumerate(segments.items()):
-        # ── Enforce overall pipeline deadline across all segments ────────
         remaining_pipeline_s = (
             None
             if pipeline_deadline is None

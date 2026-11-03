@@ -1,4 +1,8 @@
 import unittest
+import os
+import sys
+import tempfile
+from pathlib import Path
 from unittest.mock import patch
 
 import cloud_tuning
@@ -34,6 +38,19 @@ class StrictIpcGuardrailTest(unittest.TestCase):
             )
 
         self.assertTrue(report["passed"])
+
+
+class SubprocessImportsTest(unittest.TestCase):
+    def test_rag_helpers_import_from_an_unrelated_working_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = cloud_tuning._run_logged(
+                [sys.executable, "-c",
+                 "import benchmark_sources, feature_schema, run_feature_extraction_end_to_end"],
+                Path(tmp) / "imports.json",
+                cwd=Path(tmp),
+                env={**os.environ, "PYTHONPATH": ""},
+            )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
 
 if __name__ == "__main__":

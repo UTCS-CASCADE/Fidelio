@@ -8,7 +8,6 @@ from datetime import datetime
 from pathlib import Path
 
 import numpy as np
-import pandas as pd
 import requests
 import scann
 from flask import Flask, jsonify, request
@@ -16,10 +15,9 @@ from flask import Flask, jsonify, request
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from cloning_priority import evaluate_priority_constraints
-from benchmark_sources import parse_benchmark_binary_sources
-from feature_schema import (
-    CANONICAL_FEATURE_COLUMNS,
+from scripts.cloning_priority import evaluate_priority_constraints
+from scripts.benchmark_sources import parse_benchmark_binary_sources
+from scripts.feature_schema import (
     absolute_match_report,
     canonicalize_feature_dict,
     load_feature_table,
@@ -44,9 +42,6 @@ DEFAULT_XLSX = resolve_feature_table_path(REPO_ROOT / "search_engine" / "all_fea
 MATCH_ERROR_THRESHOLD = float(os.environ.get("MATCH_ERROR_THRESHOLD", "0.75"))
 ADJUSTOR_RETRIEVAL_TOP_K = int(os.environ.get("ADJUSTOR_RETRIEVAL_TOP_K", "8"))
 SEED_BASELINE_SELECTION_MODE = os.environ.get("SEED_BASELINE_SELECTION_MODE", "ipc_only").strip().lower()
-# Optional, env-gated override (default off): force seeding from a specific
-# corpus microbenchmark id (and optionally a specific binary). When unset, seed
-# selection is fully unchanged.
 FORCE_SEED_ID = os.environ.get("FORCE_SEED_ID", "").strip()
 FORCE_SEED_BINARY = os.environ.get("FORCE_SEED_BINARY", "").strip()
 IPC_FEATURE_NAME = "perf_stat.IPC"
@@ -217,10 +212,6 @@ def _choose_seed_baseline(
         if not ALL_HW_FEATURE_NAMES:
             chosen_idx, chosen_score = _best_supported_similarity(q_raw)
             return chosen_idx, chosen_score, "full_feature_supported_fallback_no_hw"
-        # Malleability weights: features hardest to change through code generation
-        # get highest weight for seed selection.  LLC/L1d require specific working-set
-        # sizes; iTLB needs many code pages — all very hard to engineer from source.
-        # IPC, icache, branch are comparatively easy to influence.
         _MALLEABILITY_WEIGHTS: dict[str, float] = {
             "perf_stat.LLC-load-misses_MPKI": 2.5,
             "perf_stat.L1-dcache-load-misses_MPKI": 1.5,

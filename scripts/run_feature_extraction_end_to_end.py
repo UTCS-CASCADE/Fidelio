@@ -1,16 +1,5 @@
 #!/usr/bin/env python3
-"""
-End-to-end feature extraction.
-
-Modes:
-  1. Binary batch mode:
-     input: directory of binaries
-     output: single XLSX with one row per (binary, microbenchmark)
-
-  2. Cloud workload mode:
-     input: workload command
-     output: single JSON with one feature vector per collected segment
-"""
+'End-to-end feature extraction.'
 
 import argparse
 import json
@@ -29,10 +18,13 @@ from typing import Dict, List, Optional, Tuple
 
 from openpyxl import Workbook
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT))
+
 from feature_extraction_engine.run_detailed_perf_benchmarks import run_single_cmd_perf_stat
 from feature_extraction_engine.run_intel_pt_record import run_single_cmd_intel_pt
 from feature_extraction_engine.run_perfspect_metrics import run_single_cmd_perfspect
-from feature_schema import CANONICAL_FEATURE_COLUMNS, canonicalize_feature_dict
+from scripts.feature_schema import CANONICAL_FEATURE_COLUMNS, canonicalize_feature_dict
 
 PERF_STAT_FEATURE_EVENTS = {
     "perf_stat.IPC": "cycles,instructions",
@@ -47,7 +39,6 @@ PERF_STAT_FEATURE_EVENTS = {
     "perf_stat.iTLB-load-misses_MPKI": "instructions,iTLB-load-misses",
 }
 
-REPO_ROOT = Path(__file__).resolve().parent
 FEATURE_EXTRACTION_ROOT = REPO_ROOT / "feature_extraction_engine"
 if str(FEATURE_EXTRACTION_ROOT) not in sys.path:
     sys.path.insert(0, str(FEATURE_EXTRACTION_ROOT))
@@ -137,9 +128,6 @@ def list_microbenchmarks(binary_path: Path, timeout_s: int = 30) -> Tuple[List[s
         bit_depth = "10bit" if binary_path.name.endswith("10") else "8bit"
         return [f"x264::{bit_depth}::{unit}" for unit in ("pixel", "dct", "mc", "intra", "deblock", "quant", "cabac")], True
 
-    # folly Benchmark binaries enumerate via --bm_list; Google Benchmark binaries
-    # (e.g. fbthrift's ProtocolBench) use --benchmark_list_tests=true. Try both so
-    # candidates from either harness reach evaluation.
     list_cmds = [
         [str(binary_path), "--bm_list"],
         [str(binary_path), "--benchmark_list_tests=true"],
@@ -251,9 +239,6 @@ def choose_unit_cmd(binary_path: Path, unit_name: str, has_bm_list: bool) -> Lis
         return [str(binary_path)]
 
     rx = f"^{re.escape(unit_name)}$"
-    # Optional iteration floor: under co-located noise the per-process counters
-    # only reflect contention when the benchmark runs long enough to overlap the
-    # noise during the perf window. CLONE_BM_MIN_ITERS forces that.
     _min_iters = os.environ.get("CLONE_BM_MIN_ITERS", "").strip()
     _it = [f"--bm_min_iters={_min_iters}"] if _min_iters else []
     candidates = [
@@ -285,11 +270,7 @@ def measure_unit_runtime(
     has_bm_list: Optional[bool] = None,
     timeout_s: float = 240.0,
 ) -> Dict[str, object]:
-    """Measure a microbenchmark's rough wall-clock runtime with a plain invocation.
-
-    This is intentionally lightweight and is used only to estimate how many
-    repeated runs would roughly cover a target cloud segment.
-    """
+    "Measure a microbenchmark's rough wall-clock runtime with a plain invocation."
     if has_bm_list is None:
         _, has_bm_list = list_microbenchmarks(binary_path)
 

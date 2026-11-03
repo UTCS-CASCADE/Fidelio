@@ -2,13 +2,14 @@ from __future__ import annotations
 
 import math
 import os
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
 import numpy as np
 import pandas as pd
 
-from cloning_priority import feature_constraint
+from scripts.cloning_priority import feature_constraint
 
 
 def resolve_feature_table_path(default_path: Path) -> Path:
@@ -277,5 +278,12 @@ def row_from_feature_json(
     return row
 
 
+@lru_cache(maxsize=2)
+def _cached_feature_table(path: Path, mtime_ns: int, size: int) -> pd.DataFrame:
+    return canonicalize_dataframe(pd.read_excel(path))
+
+
 def load_feature_table(xlsx_path: Path) -> pd.DataFrame:
-    return canonicalize_dataframe(pd.read_excel(xlsx_path))
+    path = Path(xlsx_path).resolve()
+    stat = path.stat()
+    return _cached_feature_table(path, stat.st_mtime_ns, stat.st_size).copy(deep=True)

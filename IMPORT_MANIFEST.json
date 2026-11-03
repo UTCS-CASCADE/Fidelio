@@ -32,6 +32,7 @@
   "folly_edit_rag": {
     "url": "https://github.com/Alan-S-Andrade/folly_edit_rag.git",
     "commit": "3bfe2c7c07069260786752fdd43cc355eb33187b",
-    "status": "Submodule declared in .gitmodules; gitlink registration and fetch pending because Fidelio .git is read-only and uninitialized. Run bootstrap_folly_edit_rag.sh after initializing a writable Git repository."
-  }
+    "status": "Pinned Git submodule; initialize with git submodule update --init --recursive."
+  },
+  "files_note": "Historical source import list, not the current runtime file inventory. The checkout retains counter matching and its dependencies."
 }

@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-Usage: ./run_cloud_tuning_e2e.sh [options] -- <cloud workload command...>
+Usage: ./scripts/run_cloud_tuning_e2e.sh [options] -- <cloud workload command...>
 
 Starts local adjustor/search services, runs segmented cloud feature extraction,
 then writes the final segment replacement plan JSON.
@@ -43,7 +43,7 @@ PMU collection for the workload, seed baseline, and generated candidates is
 always process-scoped so their feature vectors remain comparable.
 
 Example:
-  ./run_cloud_tuning_e2e.sh \
+  ./scripts/run_cloud_tuning_e2e.sh \
     --output-dir ./outputs/cloud_demo \
     --benchmark-name bench_ilp_cloud \
     --cloud-total-seconds 10 \
@@ -53,7 +53,7 @@ Example:
 EOF
 }
 
-REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON:-python}"
 OUTPUT_DIR="${REPO_ROOT}/outputs/cloud_e2e"
 BENCHMARK_NAME=""
@@ -133,7 +133,7 @@ fi
 
 # Fail before starting services or modifying inputs when setup is incomplete.
 if [[ ! -f "${REPO_ROOT}/folly_edit_rag/scripts/local_patch_utils.py" ]]; then
-  echo "Missing folly_edit_rag. Run ./bootstrap_folly_edit_rag.sh first (see README.md)." >&2
+  echo "Missing folly_edit_rag. Run git submodule update --init --recursive first (see README.md)." >&2
   exit 1
 fi
 if [[ ! -s "${FEATURE_TABLE_XLSX:-${REPO_ROOT}/search_engine/all_features.xlsx}" ]]; then
@@ -615,23 +615,14 @@ fi
 if [[ -n "${CLOUD_MIN_SEED_IPC_ACCURACY:-}" ]]; then
   FRONTEND_ARGS+=(--min-seed-ipc-accuracy "${CLOUD_MIN_SEED_IPC_ACCURACY}")
 fi
-"${PYTHON_BIN}" "${REPO_ROOT}/cloud_segment_frontend.py" "${FRONTEND_ARGS[@]}"
+"${PYTHON_BIN}" "${REPO_ROOT}/scripts/cloud_segment_frontend.py" "${FRONTEND_ARGS[@]}"
 FRONTEND_RC=$?
 set -e
 
-# ── Stitch per-segment sources into a single combined file ──────────────
-if [[ "${FRONTEND_RC}" -le 2 && -f "${REPLACEMENTS_JSON}" ]]; then
-  echo
-  echo "Stitching per-segment sources into combined file"
-  "${PYTHON_BIN}" "${REPO_ROOT}/stitch_segments.py" \
-    --replacements-json "${REPLACEMENTS_JSON}" || true
-fi
-# ────────────────────────────────────────────────────────────────────────
 
 echo
 echo "Cloud feature JSON: ${CLOUD_JSON}"
 echo "Replacement plan:   ${REPLACEMENTS_JSON}"
-echo "Stitched output:    ${OUTPUT_DIR}/stitched/"
 echo "Accuracy report:    embedded under accuracy_report in ${REPLACEMENTS_JSON}"
 echo "Adjustor log:       ${ADJUSTOR_LOG}"
 echo "Search log:         ${SEARCH_LOG}"

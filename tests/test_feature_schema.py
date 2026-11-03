@@ -2,7 +2,7 @@ import unittest
 
 import pandas as pd
 
-from feature_schema import canonicalize_dataframe
+from scripts.feature_schema import canonicalize_dataframe
 
 
 class CanonicalizeDataframeTest(unittest.TestCase):

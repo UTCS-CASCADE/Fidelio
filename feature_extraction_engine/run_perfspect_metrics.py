@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""
-Compatibility runner for TMA metrics.
-
-The old implementation shellled out to `perfspect`. The new implementation
-uses `perf stat --topdown --td-level 1` and exposes the same public function
-name so existing callers do not need to change at the callsite.
-"""
+'Compatibility runner for TMA metrics.'
 
 from __future__ import annotations
 
@@ -189,16 +183,6 @@ def _write_summary_csv(output_dir: Path, metrics: Dict[str, float]) -> Path:
     return summary_path
 
 
-# ---------------------------------------------------------------------------
-# Backend-bound TMA drill-down (Level-2/3) collection.
-#
-# The Level-1 `--topdown` pass only yields Frontend/Backend/BadSpec/Retiring.
-# The backend-bound prioritization profile additionally needs the memory/core
-# split and its cache drill-down. These come from perf metric groups
-# (`perf stat -M tma_*`) which require a TMA-aware perf build. We auto-detect a
-# capable perf (configurable via TMA_PERF_BIN) and collect these additively so
-# the Level-1 path is never disturbed. Disable with COLLECT_BACKEND_TMA=0.
-# ---------------------------------------------------------------------------
 BACKEND_TMA_METRICS = {
     "tma_memory_bound": "TMA_Memory_Bound(%)",
     "tma_core_bound": "TMA_Core_Bound(%)",
@@ -343,7 +327,6 @@ def collect_backend_tma_metrics(
         encoding="utf-8",
     )
     return parse_backend_tma_output((result.stdout or "") + "\n" + (result.stderr or ""))
-
 
 
 def run_single_cmd_perfspect(

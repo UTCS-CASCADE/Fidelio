@@ -12,7 +12,7 @@ import scann
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
-from feature_schema import (
+from scripts.feature_schema import (
     CANONICAL_FEATURE_COLUMNS,
     canonicalize_dataframe,
     dataframe_feature_scales,
@@ -83,11 +83,6 @@ def main() -> None:
         else np.array([""] * len(df), dtype=object)
     )
 
-    # Only index canonical columns that actually have data in the corpus.
-    # Fully-empty columns (e.g. newly-added metrics not yet extracted for the
-    # corpus) would yield NaN z-score centers and abort the ScaNN build; they
-    # are excluded here and will be picked up automatically once the corpus is
-    # re-extracted with those features populated.
     feature_names = [
         c
         for c in CANONICAL_FEATURE_COLUMNS
@@ -95,9 +90,6 @@ def main() -> None:
     ]
     X_nan = df[feature_names].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=np.float32)
 
-    # Compute statistics from non-NaN values only, then impute missing values
-    # with column means so they map to zero after z-score normalization.
-    # Using fillna(0.0) would bias distance calculations for missing features.
     mu = np.nanmean(X_nan, axis=0, keepdims=True)
     sigma = np.nanstd(X_nan, axis=0, keepdims=True)
     sigma = np.where(sigma < 1e-12, 1.0, sigma)

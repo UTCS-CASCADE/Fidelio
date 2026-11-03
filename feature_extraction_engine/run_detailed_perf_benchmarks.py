@@ -1,11 +1,4 @@
 #!/usr/bin/env python3
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
-# This source code is licensed under the MIT license found in the
-# LICENSE file in the root directory of this source tree.
-#
-# Advanced script to run folly microbenchmark units with perf stat
-# Automatically discovers benchmarks and measures each unit for its entire duration
 
 import json
 import subprocess
@@ -15,10 +8,8 @@ import re
 import time
 import shlex
 from pathlib import Path
-from datetime import datetime
 from typing import List, Dict, Tuple, Optional
 import argparse
-import tempfile
 
 class FollyBenchmarkPerfRunner:
     """Run folly benchmark units and generic binaries with perf stat measurements."""
@@ -79,12 +70,7 @@ class FollyBenchmarkPerfRunner:
         return probe_times
 
     def save_probe_times(self, benchmark_name: str, probe_times: Dict[str, float]) -> Path:
-        """Save probe times (unit durations) to disk as {bench_name}_probe_times.txt.
-        
-        probe_times should be dict of unit_name -> duration_in_seconds
-        
-        Returns path to the saved file.
-        """
+        'Save probe times (unit durations) to disk as {bench_name}_probe_times.txt. probe_times should be dict of unit_name -> duration_in_seconds Returns path to the saved file.'
         if not probe_times:
             return None
         
@@ -100,7 +86,7 @@ class FollyBenchmarkPerfRunner:
 
     def discover_benchmarks(self):
         """Discover all benchmark binaries in configured directories and patterns."""
-        print(f"Scanning for benchmark binaries...")
+        print("Scanning for benchmark binaries...")
 
         # 1. Discover folly/wdl_bench benchmarks
         possible_paths = [
@@ -150,16 +136,10 @@ class FollyBenchmarkPerfRunner:
                             self.benchmark_type[name] = 'generic'
                             print(f"Discovered generic benchmark: {name} -> {binary}")
         else:
-            print(f"\nNo additional benchmark paths configured.")
+            print("\nNo additional benchmark paths configured.")
     
     def run_benchmark_get_units(self, benchmark_name: str) -> Dict[str, float]:
-        """Run benchmark and extract unit names with their estimated throughput.
-        
-        For folly benchmarks: uses --bm_list or --json flags
-        For generic binaries: treats the entire binary as a single unit
-        
-        Returns dict mapping unit_name -> throughput (iters/sec)
-        """
+        'Run benchmark and extract unit names with their estimated throughput.'
         
         if benchmark_name not in self.benchmarks:
             return {}
@@ -258,7 +238,7 @@ class FollyBenchmarkPerfRunner:
             return units
 
         except subprocess.TimeoutExpired:
-            print(f"  Warning: Benchmark timed out")
+            print("  Warning: Benchmark timed out")
             return {}
         except Exception as e:
             print(f"  Error: {e}")
@@ -310,11 +290,7 @@ class FollyBenchmarkPerfRunner:
         return units
     
     def calculate_measurement_duration(self, throughput: float, target_iterations: int = 100000) -> float:
-        """Calculate measurement duration based on throughput.
-        
-        Ensures we capture at least target_iterations worth of data.
-        throughput: iterations/second
-        """
+        'Calculate measurement duration based on throughput. Ensures we capture at least target_iterations worth of data. throughput: iterations/second'
         
         if throughput <= 0:
             return 0.5  # Default 500ms
@@ -329,13 +305,7 @@ class FollyBenchmarkPerfRunner:
     
     def run_unit_with_perf(self, benchmark_binary: Path, unit_name: str,
                           throughput: float = 0) -> Tuple[bool, str, float]:
-        """Run a single benchmark unit with perf stat for appropriate duration.
-        
-        For folly benchmarks: runs with --bm_pattern flag
-        For generic binaries: runs the binary directly
-        
-        Returns (success, output_file, elapsed_time)
-        """
+        'Run a single benchmark unit with perf stat for appropriate duration. For folly benchmarks: runs with --bm_pattern flag For generic binaries: runs the binary directly Returns (success, output_file, elapsed_time)'
         
         benchmark_name = benchmark_binary.name
         benchmark_type = self.benchmark_type.get(benchmark_name, 'folly')
@@ -347,7 +317,6 @@ class FollyBenchmarkPerfRunner:
         binary_out_dir.mkdir(parents=True, exist_ok=True)
         
         perf_output_file = binary_out_dir / f"{benchmark_name}_{safe_unit_name}_perf.txt"
-        perf_json_file = binary_out_dir / f"{benchmark_name}_{safe_unit_name}_perf.json"
         
         # Check if already completed (output file exists)
         if perf_output_file.exists():
@@ -498,7 +467,7 @@ class FollyBenchmarkPerfRunner:
                 units = self.run_benchmark_get_units(benchmark_name)
             
             if not units:
-                print(f"  (no units found or benchmark failed)")
+                print("  (no units found or benchmark failed)")
                 continue
             
             # Check if all units have output files
@@ -599,16 +568,7 @@ class FollyBenchmarkPerfRunner:
         print(f"{'='*70}\n")
 
 def parse_perf_stat_output(text, elapsed=None):
-    """Parse perf stat stderr output into a dict of metrics.
-    
-    Args:
-        text: The stderr output from perf stat.
-        elapsed: Optional wall-clock elapsed time (seconds). If not provided,
-                 parsed from perf output.
-    
-    Returns:
-        Dict of metric_name -> numeric_value.
-    """
+    'Parse perf stat stderr output into a dict of metrics.'
     metrics = {}
     event_counts = {}
     
@@ -698,16 +658,7 @@ def run_single_cmd_perf_stat(
     feature_window_s: Optional[float] = None,
     target_pid: Optional[int] = None,
 ):
-    """Run perf stat on a single arbitrary command and return parsed metrics dict.
-    
-    Args:
-        cmd_list: List of strings representing the command to run.
-        perf_events: Comma-separated string of PMU events. Uses default set if None.
-        output_dir: Optional directory to save raw perf output.
-    
-    Returns:
-        Dict of metric_name -> numeric_value (IPC + *_MPKI metrics).
-    """
+    'Run perf stat on a single arbitrary command and return parsed metrics dict.'
     if perf_events is None:
         perf_events = ('cycles,instructions,L1-icache-load-misses,iTLB-load-misses,'
                        'dTLB-load-misses,'

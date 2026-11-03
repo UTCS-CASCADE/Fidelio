@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import os
+from functools import lru_cache
+from pathlib import Path
 from typing import Any
 
-from cloning_priority import (
+from scripts.cloning_priority import (
     evaluate_priority_constraints,
     first_unsatisfied_priority,
     priority_tier_label,
     priority_tier_state,
     tolerance_bounds,
 )
-from feature_prompt_guidance import feature_prompt_guidance
-from feature_schema import canonicalize_feature_dict, feature_display_name
+from scripts.feature_prompt_guidance import feature_prompt_guidance
+from scripts.feature_schema import canonicalize_feature_dict, feature_display_name
 
 
 FRONTEND_PLAYBOOK_FEATURES: tuple[str, ...] = (
@@ -312,15 +314,7 @@ def _effect_metric_label(feature_name: str) -> str:
 
 
 def expected_effect_directive(feature_name: str, status: str) -> str:
-    """Return the spec directive describing what the prescribed optimization
-    is expected to do to the diagnosed counter.
-
-    ``status`` is the diagnosed metric status ("too low" / "too high" /
-    "within range"). A "too low" counter is raised, a "too high" counter is
-    reduced. The phrasing is deliberately terse so it can be embedded directly
-    in the spec/prompt (e.g. "This reduces L1i MPKI") and later parsed by the
-    deciding script via :data:`EFFECT_VERB_DIRECTION`.
-    """
+    'Return the spec directive describing what the prescribed optimization is expected to do to the diagnosed counter.'
     label = _effect_metric_label(feature_name)
     if status == "too low":
         return f"This raises {label}."
@@ -338,119 +332,6 @@ def expected_effect_direction(directive: str) -> str:
         if verb in text:
             return direction
     return "unknown"
-
-
-def _observed_direction(before: float, after: float, *, rel_eps: float = 0.02) -> str:
-    """Classify the measured movement of a counter across an optimization.
-
-    A change smaller than ``rel_eps`` (relative to the before magnitude, with a
-    tiny absolute floor) is treated as "hold" so measurement noise is not
-    mistaken for a real effect."""
-    delta = after - before
-    floor = max(abs(before) * rel_eps, 1e-9)
-    if delta > floor:
-        return "increase"
-    if delta < -floor:
-        return "decrease"
-    return "hold"
-
-
-def validate_playbook_effects(
-    records: list[dict[str, Any]],
-    *,
-    rel_eps: float = 0.02,
-) -> dict[str, Any]:
-    """Confirm that prescribed optimizations actually moved their counters the
-    way the spec directive claimed, across a fleet of measured benchmarks.
-
-    Each record describes one applied optimization on one benchmark and must
-    provide:
-
-    - ``benchmark``: fleet member / segment name (str).
-    - ``feature_name``: the diagnosed counter the optimization targeted.
-    - ``before_value`` / ``after_value``: the measured counter value before and
-      after applying the optimization.
-    - one of ``directive`` (the spec text) or ``status`` (the diagnosed
-      status, used to regenerate the directive).
-
-    Returns a report with one entry per record plus fleet-wide aggregates. An
-    optimization "confirms" when the observed counter movement matches the
-    direction claimed by its directive (a directive that claims no movement,
-    "hold", confirms when the counter stays within ``rel_eps``).
-    """
-    results: list[dict[str, Any]] = []
-    confirmed = 0
-    evaluable = 0
-    for record in records:
-        feature_name = str(record.get("feature_name", "")).strip()
-        directive = record.get("directive")
-        status = str(record.get("status", "")).strip()
-        if not directive and feature_name:
-            directive = expected_effect_directive(feature_name, status)
-        expected = expected_effect_direction(str(directive or ""))
-        entry: dict[str, Any] = {
-            "benchmark": str(record.get("benchmark", "")).strip(),
-            "feature_name": feature_name,
-            "feature_label": _effect_metric_label(feature_name) if feature_name else "",
-            "directive": str(directive or "").strip(),
-            "expected_direction": expected,
-        }
-        try:
-            before = float(record.get("before_value"))
-            after = float(record.get("after_value"))
-        except Exception:
-            entry.update(
-                {
-                    "before_value": record.get("before_value"),
-                    "after_value": record.get("after_value"),
-                    "observed_direction": "unknown",
-                    "confirmed": False,
-                    "evaluable": False,
-                    "note": "before/after values not numeric",
-                }
-            )
-            results.append(entry)
-            continue
-        observed = _observed_direction(before, after, rel_eps=rel_eps)
-        is_evaluable = expected in ("increase", "decrease", "hold")
-        is_confirmed = is_evaluable and observed == expected
-        if is_evaluable:
-            evaluable += 1
-        if is_confirmed:
-            confirmed += 1
-        entry.update(
-            {
-                "before_value": before,
-                "after_value": after,
-                "delta": after - before,
-                "observed_direction": observed,
-                "confirmed": is_confirmed,
-                "evaluable": is_evaluable,
-                "note": "" if is_evaluable else "directive has no parseable effect direction",
-            }
-        )
-        results.append(entry)
-
-    by_feature: dict[str, dict[str, int]] = {}
-    for entry in results:
-        if not entry.get("evaluable"):
-            continue
-        feat = entry["feature_name"]
-        bucket = by_feature.setdefault(feat, {"confirmed": 0, "total": 0})
-        bucket["total"] += 1
-        if entry["confirmed"]:
-            bucket["confirmed"] += 1
-
-    return {
-        "records": results,
-        "total": len(results),
-        "evaluable": evaluable,
-        "confirmed": confirmed,
-        "violations": [e for e in results if e.get("evaluable") and not e.get("confirmed")],
-        "fleet_confirm_rate": (confirmed / evaluable) if evaluable else 0.0,
-        "all_confirmed": evaluable > 0 and confirmed == evaluable,
-        "by_feature": by_feature,
-    }
 
 
 def _playbook_payload(
@@ -701,6 +582,7 @@ def _sentence(text: str) -> str:
     return cleaned.rstrip(".") + "."
 
 
+@lru_cache(maxsize=1)
 def _detect_cache_hierarchy() -> str | None:
     """Read CPU cache sizes from sysfs and return a one-line summary, or None."""
     sizes: dict[str, str] = {}
@@ -713,9 +595,9 @@ def _detect_cache_hierarchy() -> str | None:
             if not os.path.isdir(idx_path):
                 continue
             try:
-                level = open(os.path.join(idx_path, "level")).read().strip()
-                ctype = open(os.path.join(idx_path, "type")).read().strip().lower()
-                size = open(os.path.join(idx_path, "size")).read().strip()
+                level = (Path(idx_path) / "level").read_text().strip()
+                ctype = (Path(idx_path) / "type").read_text().strip().lower()
+                size = (Path(idx_path) / "size").read_text().strip()
             except OSError:
                 continue
             if level == "1" and "data" in ctype:
@@ -742,8 +624,6 @@ def _detect_cache_hierarchy() -> str | None:
         return None
 
 
-# ── Feature coupling constants ────────────────────────────────────────────
-# Pairs of features that have conflicting data-size requirements.
 _CONFLICTING_FEATURE_PAIRS: tuple[tuple[str, str, str], ...] = (
     (
         "perf_stat.L1-dcache-load-misses_MPKI",
@@ -935,8 +815,7 @@ def build_diagnostician_report(
 
     generator_guidance = []
     generator_guidance.append(
-        f"{expected_effect} Make the edit so this effect is measurable; the deciding "
-        "script verifies it materializes across the benchmark fleet."
+        expected_effect
     )
     if delegated_from_ipc and delegation_reason:
         generator_guidance.append(delegation_reason)

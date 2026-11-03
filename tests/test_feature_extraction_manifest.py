@@ -3,7 +3,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from run_feature_extraction_end_to_end import load_command_manifest
+from scripts.run_feature_extraction_end_to_end import load_command_manifest
 
 
 class CommandManifestTest(unittest.TestCase):

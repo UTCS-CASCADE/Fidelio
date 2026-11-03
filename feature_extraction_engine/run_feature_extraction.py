@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""
-Feature Extraction
-
-Runs all three metric collection tools (perf stat, Intel PT, TMA analysis) on a
-single command-line benchmark and produces a unified JSON feature-extraction file.
-
-Most of the stuff here is for WDL binaries but works for any.
-"""
+'Feature Extraction'
 
 import atexit
 import argparse
@@ -30,14 +23,7 @@ from run_intel_pt_record import run_single_cmd_intel_pt
 
 
 def cleanup_dcperf_workload() -> None:
-    """
-    Kill all DCPerf worker processes (ffmpeg, benchpress_cli, etc.).
-    Called on script exit to ensure thorough cleanup.
-
-    Uses pgrep to find matching PIDs, then excludes our own PID and our
-    ancestor PIDs (parent shell script, etc.) so we never accidentally
-    kill the calling pipeline.
-    """
+    'Kill all DCPerf worker processes (ffmpeg, benchpress_cli, etc.). Called on script exit to ensure thorough cleanup.'
     my_pid = os.getpid()
     # Collect ancestor PIDs to protect the entire parent chain
     protected = {my_pid}
@@ -152,13 +138,7 @@ def discover_wdl_units(binary_path: Path, unit_filter: str = None) -> list:
 
 
 def extract_benchmark_name(cmd_list):
-    """Extract a short benchmark name from the command list.
-
-    Uses the basename of the first token (the executable).
-    Examples:
-      ['sysbench', 'cpu', ...] -> 'sysbench'
-      ['/usr/bin/my_bench', ...] -> 'my_bench'
-    """
+    'Extract a short benchmark name from the command list.'
     if not cmd_list:
         return "unknown"
     exe = Path(cmd_list[0]).name
@@ -179,11 +159,7 @@ def _set_feature_window_env(warmup_s: float, window_s: float):
 
 
 def _maybe_call_with_window(fn, *args, warmup_s: float, window_s: float, **kwargs):
-    """
-    Call downstream runner functions in a backward-compatible way:
-      - Prefer passing warmup/window kwargs if the callee accepts them.
-      - Otherwise fall back to calling without them (env vars still set).
-    """
+    'Call downstream runner functions in a backward-compatible way: - Prefer passing warmup/window kwargs if the callee accepts them. - Otherwise fall back to calling without them (env vars still set).'
     call_kwargs = dict(kwargs)
     call_kwargs["feature_warmup_s"] = warmup_s
     call_kwargs["feature_window_s"] = window_s
@@ -324,7 +300,6 @@ def main():
         default=3.0,
         help='Max per-segment collection duration in cloud mode (default: 3, capped at 3)'
     )
-    # ------------------------------------------------------------
 
     parser.add_argument(
         '--cmd',
@@ -430,7 +405,7 @@ def main():
         benchmark_name = args.benchmark_name or extract_benchmark_name(cmd_list)
 
     print(f"{'='*70}")
-    print(f"Feature Extraction Pipeline")
+    print("Feature Extraction Pipeline")
     print(f"{'='*70}")
     print(f"Benchmark name: {benchmark_name}")
     if args.wdl_binary:
@@ -455,13 +430,11 @@ def main():
               f"FEATURE_WINDOW_S={os.environ.get('FEATURE_WINDOW_S')})")
     else:
         print("Feature extraction timing: (default) full run / existing behavior")
-    # ----------------------------------------------------------
     print(f"{'='*70}\n")
 
     def collect_once(pass_cmd_list, pass_output_dir: Path, pass_warmup_s: float, pass_window_s: float, target_pid=None):
         pass_metrics = OrderedDict()
 
-        # ---- Step 1: perf stat (hardware counters) ----
         if not args.skip_perf_stat:
             print("\n" + "="*70)
             print("STEP 1/3: Collecting perf stat hardware counters")
@@ -486,7 +459,6 @@ def main():
         else:
             print("\n[Step 1] Skipped perf stat collection")
 
-        # ---- Step 2: topdown (TMA metrics) ----
         if not args.skip_tma:
             print("\n" + "="*70)
             print("STEP 2/3: Collecting perf-stat topdown TMA metrics")
@@ -513,7 +485,6 @@ def main():
         else:
             print("\n[Step 2] Skipped topdown TMA collection")
 
-        # ---- Step 3: Intel PT (instruction trace analysis) ----
         if not args.skip_intel_pt:
             print("\n" + "="*70)
             print("STEP 3/3: Collecting Intel PT instruction trace metrics")
@@ -558,10 +529,6 @@ def main():
                     preexec_fn=os.setsid,
                     text=True,
                 )
-                # Write the process group ID so the shell caller can kill the
-                # entire group (sudo kill -KILL -- -<pgid>) after extraction.
-                # Since preexec_fn=os.setsid makes the child the PGID leader,
-                # workload_proc.pid == PGID of the outer process group.
                 workload_pid_path = run_output_dir / "cloud_workload.pid"
                 try:
                     workload_pid_path.write_text(str(workload_proc.pid))
@@ -655,7 +622,7 @@ def main():
             json.dump(all_metrics, f, indent=4)
 
         print(f"\n{'='*70}")
-        print(f"FEATURE EXTRACTION COMPLETE")
+        print("FEATURE EXTRACTION COMPLETE")
         print(f"{'='*70}")
         if args.cloud_mode:
             print(f"Segments planned:   {all_metrics.get('segments_planned', 0)}")

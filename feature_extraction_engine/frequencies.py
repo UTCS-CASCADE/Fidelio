@@ -1,23 +1,10 @@
 #!/usr/bin/env python3
-"""
-Compute CDF distributions for Intel PT disassembled traces.
-
-Processing flow:
-  1. Iterate through binary subdirectories in the parent input directory
-  2. For each disassembled microbenchmark trace file:
-     - Parse instructions and group into basic blocks
-     - Compute: block sizes, jump sizes, RAW dependency distances, branch run lengths
-     - Compute instruction family breakdown
-     - Generate P50 values for each metric
-     - Output a single CSV file: {microbenchmark}_percentiles.csv
-
-Usage:
-  python3 frequencies.py -i /path/to/parent_dir -o /path/to/output_dir
-"""
+'Compute CDF distributions for Intel PT disassembled traces.'
 
 import re
 import csv
 from collections import Counter, defaultdict
+from functools import lru_cache
 import argparse
 from pathlib import Path
 import numpy as np
@@ -82,6 +69,7 @@ def parse_line(line) -> Optional[Instruction]:
     process, pid, cpu, timestamp, address, function, binary, instruction = m.groups()
     return Instruction(process, pid, cpu, timestamp, address, function.strip(), binary.strip(), instruction.strip())
 
+@lru_cache(maxsize=8192)
 def classify_instruction(instr: str) -> str:
     """
     Heuristic categorization into families:
@@ -134,7 +122,7 @@ def classify_instruction(instr: str) -> str:
 
     return "other"
 
-def parse_trace(filename):
+def parse_trace(filename, *, count_families=True):
     instructions = []
     family_counts = Counter()
     with open(filename, "r") as f:
@@ -143,13 +131,10 @@ def parse_trace(filename):
             if not ins:
                 continue
             instructions.append(ins)
-            fam = classify_instruction(ins.instruction)
-            family_counts[fam] += 1
+            if count_families:
+                family_counts[classify_instruction(ins.instruction)] += 1
     return instructions, family_counts
 
-# -----------------------------
-# Block building & jumps
-# -----------------------------
 
 PAGE_SEQ_LIMIT = 8 
 
@@ -261,32 +246,7 @@ def compute_runs(branches):
         not_taken_runs.append(length)
     return taken_runs, not_taken_runs
 
-def compute_cdf(data):
-    """Return sorted x and cumulative y values."""
-    if not data:
-        return [], []
-    data = sorted(data)
-    n = len(data)
-    x = data
-    y = [i / n for i in range(1, n + 1)]
-    return x, y
 
-def plot_cdfs_taken_not_taken(run_dict, title, out_path):
-    plt.figure(figsize=(9, 6))
-    for label, runs in run_dict.items():
-        if not runs:
-            continue
-        x, y = compute_cdf(runs)
-        plt.plot(x, y, label=label, linewidth=2)
-    plt.xlabel("Consecutive Conditional Branch Run Length")
-    plt.ylabel("CDF")
-    plt.title(title)
-    plt.legend()
-    plt.grid(True, linestyle="--", alpha=0.6)
-    plt.xscale("log")  # log helps for long tails
-    plt.tight_layout()
-    plt.savefig(out_path, dpi=150)
-    plt.close()
 
 def compute_jump_sizes_with_blocklens(blocks):
     """
@@ -307,16 +267,9 @@ def compute_jump_sizes_with_blocklens(blocks):
         block_lens.append(src_len)
         pairs.append((src_len, diff))
     return jump_sizes, block_lens, pairs
-#-------------------------
-# Family counts per block (single app)
-# -----------------------------
 
 def family_counts_per_block(instructions, blocks):
-    """
-    For the given instruction list and its blocks, return:
-      - per_block_counts: list[Counter(family->count)] aligned with blocks
-      - family_lists: dict[family] -> list of integer counts (same order as blocks)
-    """
+    'For the given instruction list and its blocks, return: - per_block_counts: list[Counter(family->count)] aligned with blocks - family_lists: dict[family] -> list of integer counts (same order as blocks)'
     # Build a fast index of instruction -> family
     fam_by_idx = []
     for ins in instructions:
@@ -341,80 +294,11 @@ def family_counts_per_block(instructions, blocks):
 
     return per_block_counts, family_lists
 
-# -----------------------------
-# Math helpers & plotting
-# -----------------------------
-
-def compute_cdf(data):
-    data = np.sort(np.asarray(data))
-    n = len(data)
-    if n == 0:
-        return np.array([]), np.array([])
-    y = np.arange(1, n + 1) / n
-    return data, y
-
-
-
-# def plot_jump_vs_blocklen_scatter(pairs_by_trace, output_dir, kernel_space):
-#     # Combined
-#     plt.figure(figsize=(9, 6))
-#     for label, pairs in pairs_by_trace.items():
-#         if not pairs:
-#             continue
-#         xs = [p[0] for p in pairs]
-#         ys = [p[1] for p in pairs]
-#         plt.scatter(xs, ys, s=12, alpha=0.4, label=label)
-#     plt.yscale("log")
-#     plt.xscale("log")
-#     plt.xlabel("Block Length (sequential instruction count)")
-#     plt.ylabel("Next Jump Size (abs VA difference, log)")
-#     plt.title(f"Jump Size vs. Block Length ({'Kernel' if kernel_space else 'User'}-Space)")
-#     plt.grid(True, which="both", linestyle="--", alpha=0.5)
-#     plt.legend(markerscale=2, fontsize="small")
-#     plt.tight_layout()
-#     out = output_dir / "jump_vs_blocklen_all_traces.png"
-#     plt.savefig(out, dpi=150)
-#     print(f"Wrote {out}")
-#     plt.close()
-
-#     # Per-trace
-#     for label, pairs in pairs_by_trace.items():
-#         if not pairs:
-#             continue
-#         xs = [p[0] for p in pairs]
-#         ys = [p[1] for p in pairs]
-#         plt.figure(figsize=(8, 5))
-#         plt.scatter(xs, ys, s=14, alpha=0.6)
-#         plt.yscale("log")
-#         plt.xscale("log")
-#         plt.xlabel("Block Length (sequential instruction count)")
-#         plt.ylabel("Next Jump Size (abs VA difference, log)")
-#         plt.title(f"Jump Size vs. Block Length — {label}")
-#         plt.grid(True, which="both", linestyle="--", alpha=0.5)
-#         plt.tight_layout()
-#         out = output_dir / f"jump_vs_blocklen_{label}.png"
-#         plt.savefig(out, dpi=150)
-#         print(f"Wrote {out}")
-#         plt.close()
-
 
 
 
 def write_microbenchmark_distributions_csv(mb_label: str, datasets: Dict[str, List[float]], output_dir: Path) -> bool:
-    """
-    Write a single CSV with P50 values for one microbenchmark.
-    
-    Format:
-      metric_type, P50
-      block_sizes, val
-      jumps, val
-      raw_deps, val
-      taken_runs, val
-      not_taken_runs, val
-      family::*, val
-    
-    Returns True if successful, False otherwise.
-    """
+    'Write a single CSV with P50 values for one microbenchmark.'
     if not datasets:
         return False
 
@@ -444,10 +328,9 @@ def write_microbenchmark_distributions_csv(mb_label: str, datasets: Dict[str, Li
                 w.writerow([metric_name] + [int(round(float(x))) for x in freqs])
         
         return True
-    except Exception as e:
+    except Exception:
         return False
 
-# --- Register canonicalization ---
 
 _alias_groups = [
     ("rax", ["rax","eax","ax","al","ah"]),
@@ -473,11 +356,7 @@ for i in range(8,16):
     _alias_map[f"{base}b"] = base
 
 def canonical_reg(reg: str) -> Optional[str]:
-    """
-    Return architectural register name for RAW tracking.
-    Keeps xmm/ymm/zmm/k as-is (lowercased).
-    Returns None for weird or segment/debug regs we choose to ignore.
-    """
+    'Return architectural register name for RAW tracking. Keeps xmm/ymm/zmm/k as-is (lowercased). Returns None for weird or segment/debug regs we choose to ignore.'
     if not reg:
         return None
     r = reg.lower().lstrip('%')
@@ -659,16 +538,13 @@ def reads_writes_for_instruction(instr_text: str) -> Tuple[Set[str], Set[str]]:
     return reads, writes
 
 def raw_dependency_distances(instructions: List[Instruction]) -> List[int]:
-    """
-    Compute RAW distances (in number of intervening dynamic instructions)
-    per trace stream. Distance for a read of register R is i - last_write[R],
-    if a previous write to R exists. Resets tracking across PID/binary changes.
-    """
+    'Compute RAW distances (in number of intervening dynamic instructions) per trace stream. Distance for a read of register R is i - last_write[R], if a previous write to R exists. Resets tracking across PID/binary changes.'
     dists: List[int] = []
     last_write: Dict[str, int] = {}
     prev_pid = None
     prev_lib = None
 
+    decode = lru_cache(maxsize=8192)(reads_writes_for_instruction)
     for i, ins in enumerate(instructions):
         # Reset when context changes (avoid cross-PID/lib linking)
         curr_pid = ins.pid
@@ -679,7 +555,7 @@ def raw_dependency_distances(instructions: List[Instruction]) -> List[int]:
             last_write.clear()
             prev_pid, prev_lib = curr_pid, curr_lib
 
-        reads, writes = reads_writes_for_instruction(ins.instruction)
+        reads, writes = decode(ins.instruction)
 
         # record distances for each read that has a prior write
         for r in reads:
@@ -705,11 +581,7 @@ def write_raw_csv(raw_dict: Dict[str, List[int]], output_dir: Path):
                 w.writerow([i, d])
 
 def write_cdf_percentiles_csv(jump_dict: Dict[str, List[int]], output_dir: Path):
-    """
-    For each application/trace, compute CDF P50
-    using the same values plotted in the CDF curves.
-    Writes one CSV per app.
-    """
+    'For each application/trace, compute CDF P50 using the same values plotted in the CDF curves. Writes one CSV per app.'
     percentiles = [0.5]
 
     for label, jumps in jump_dict.items():
@@ -773,9 +645,6 @@ def main():
         for dis_file in dis_files:
             total_processed += 1
             
-            # Extract microbenchmark label from filename
-            # Filename format: {binary_name}_{unit_name}_pt_dis.data
-            # We want just the {unit_name} part
             filename_stem = dis_file.stem  # removes .data
             # filename_stem is like "container_hash_maps_bench_%Clear    unord_NonSSOString..._pt_dis"
             # We need to extract just the unique microbenchmark identifier
@@ -831,7 +700,7 @@ def main():
             else:
                 print(f"  [FAILED] {mb_label}: could not write CSV")
     
-    print(f"\n=== Summary ===")
+    print("\n=== Summary ===")
     print(f"Total processed: {total_processed}")
     print(f"Successful: {total_success}")
     print(f"Failed: {total_processed - total_success}")

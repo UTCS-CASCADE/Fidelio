@@ -5,7 +5,6 @@ import json
 import math
 import os
 import re
-import shutil
 import subprocess
 import sys
 import threading
@@ -16,12 +15,12 @@ from typing import Any
 
 import pandas as pd
 
-from benchmark_sources import (
+from scripts.benchmark_sources import (
     parse_benchmark_binary_sources,
     resolve_build_timeout_sec,
     resolve_preferred_build_dir,
 )
-from cloning_priority import (
+from scripts.cloning_priority import (
     active_constraints as _active_constraints,
     candidate_rank_key,
     evaluate_priority_constraints,
@@ -31,9 +30,9 @@ from cloning_priority import (
     prioritized_gap_key,
     tolerance_bounds,
 )
-from diagnostician import build_diagnostician_report
-from feature_prompt_guidance import feature_prompt_guidance
-from feature_schema import (
+from agents.diagnostician import build_diagnostician_report
+from scripts.feature_prompt_guidance import feature_prompt_guidance
+from scripts.feature_schema import (
     CANONICAL_FEATURE_COLUMNS,
     absolute_match_report,
     canonicalize_feature_dict,
@@ -42,7 +41,7 @@ from feature_schema import (
     resolve_feature_table_path,
 )
 from folly_edit_rag.scripts.local_patch_utils import validate_generated_source_output
-from run_feature_extraction_end_to_end import (
+from scripts.run_feature_extraction_end_to_end import (
     choose_unit_cmd,
     collect_application_seed_features,
     collect_unit_features,
@@ -60,7 +59,6 @@ PROPERTY_TASKS_MANIFEST = (
 PROPERTY_TASKS_DIR.mkdir(parents=True, exist_ok=True)
 DEFAULT_XLSX = resolve_feature_table_path(REPO_ROOT / "search_engine" / "all_features.xlsx")
 
-# ── Token usage sidecar helpers ─────────────────────────────────────────────
 _PATCHES_DIR = FOLLY_EDIT_RAG_SCRIPTS / "outputs" / "patches"
 _COMPILE_LOGS_DIR = FOLLY_EDIT_RAG_SCRIPTS / "outputs" / "compile_logs"
 
@@ -185,37 +183,11 @@ MIN_COMPILE_BUDGET_SECONDS = float(os.environ.get("CLOUD_MIN_COMPILE_BUDGET_SECO
 MIN_EVALUATE_BUDGET_SECONDS = float(os.environ.get("CLOUD_MIN_EVALUATE_BUDGET_SECONDS", "45"))
 GENERATION_QUICK_RETRIES = int(os.environ.get("CLOUD_GENERATION_QUICK_RETRIES", "2"))
 
-# ── Adaptive tier tolerance ─────────────────────────────────────────────────
-# After ADAPTIVE_TIER_STAGNATION_WINDOW consecutive attempts without a
-# promotion at the current objective tier (T1+), relax the active tier's
-# tolerance by ADAPTIVE_TIER_TOLERANCE_BOOST so that marginal improvements
-# are accepted and compound over multiple promotions.  T0 IPC is never
-# relaxed because it is the primary fidelity signal.
 ADAPTIVE_TIER_STAGNATION_WINDOW = int(os.environ.get("CLOUD_ADAPTIVE_TIER_STAGNATION_WINDOW", "3"))
 ADAPTIVE_TIER_TOLERANCE_BOOST = float(os.environ.get("CLOUD_ADAPTIVE_TIER_TOLERANCE_BOOST", "1.5"))
 
-# ── Tier escalation ────────────────────────────────────────────────────────
-# After TIER_ESCALATION_WINDOW consecutive attempts without a promotion,
-# automatically advance the objective_priority_rank to the next tier even
-# if the current tier's features are not within tolerance.  This prevents
-# lower-tier features (e.g., iTLB at rank 4) from never being addressed
-# because an upper tier (e.g., L1i at rank 2) can't be fully matched.
 TIER_ESCALATION_WINDOW = int(os.environ.get("CLOUD_TIER_ESCALATION_WINDOW", "8"))
 
-# ── Tournament mode ─────────────────────────────────────────────────────────
-TOURNAMENT_MODE = os.environ.get("CLOUD_TOURNAMENT_MODE", "0").strip().lower() not in {
-    "", "0", "false", "no", "off",
-}
-# Comma-separated list of provider tags, e.g. "bedrock,vertex".
-_TOURNAMENT_PROVIDERS_RAW = os.environ.get("CLOUD_TOURNAMENT_PROVIDERS", "bedrock,vertex")
-TOURNAMENT_PROVIDERS: list[str] = [
-    p.strip().lower() for p in _TOURNAMENT_PROVIDERS_RAW.split(",") if p.strip()
-]
-
-# ── Two-phase model strategy ────────────────────────────────────────────────
-# When set, uses a strong model (e.g. gemini-2.5-pro) for T0 IPC solving and
-# then switches to a faster model (e.g. gemini-2.5-flash) for T1+ throughput
-# exploration.  Empty string = disabled (single model throughout).
 TWO_PHASE_T0_MODEL = os.environ.get("CLOUD_TWO_PHASE_T0_MODEL", "").strip()
 TWO_PHASE_EXPLORATION_MODEL = os.environ.get("CLOUD_TWO_PHASE_EXPLORATION_MODEL", "").strip()
 TWO_PHASE_ENABLED = bool(TWO_PHASE_T0_MODEL and TWO_PHASE_EXPLORATION_MODEL)
@@ -233,18 +205,6 @@ def _two_phase_model_env(objective_priority_rank: int | None) -> dict[str, str] 
         "VERTEX_GENERATION_MODEL_NAME": model,
         "VERTEX_REPAIR_MODEL_NAME": model,
     }
-
-
-def _build_provider_env(provider_tag: str) -> dict[str, str]:
-    """Return a full env dict that overrides LLM_PROVIDER for *provider_tag*.
-
-    Bedrock environment variables (model names, region, auth) and Vertex
-    variables should already be present in the parent process environment;
-    we only need to flip ``LLM_PROVIDER``.
-    """
-    env = dict(os.environ)
-    env["LLM_PROVIDER"] = provider_tag
-    return env
 
 
 def _deadline_from_wall_seconds(max_wall_seconds: float | None) -> float | None:
@@ -307,10 +267,6 @@ def _hardware_counter_match_report(
     candidate_features: dict[str, Any],
     feature_scales: dict[str, float],
 ) -> dict[str, object]:
-    # Apply a target-proportional floor so outlier targets (values far
-    # from the database distribution) cannot generate extreme normalised
-    # errors that make per-attempt progress on the remaining features
-    # invisible in the weighted mean.
     adjusted_scales = feature_scales
     if SCALE_TARGET_FLOOR_RATIO > 0:
         adjusted_scales = dict(feature_scales)
@@ -351,13 +307,7 @@ def _relaxed_constraint_report(
     active_priority_rank: int,
     tolerance_boost: float,
 ) -> dict[str, Any]:
-    """Re-evaluate constraints with inflated tolerance for *active_priority_rank*.
-
-    Features belonging to the active tier get their tolerance multiplied by
-    *tolerance_boost* (e.g. 1.5 turns 8% into 12%).  All other tiers keep
-    their original tolerance so that IPC (T0) and already-solved tiers are
-    never relaxed.
-    """
+    'Re-evaluate constraints with inflated tolerance for *active_priority_rank*.'
     target = _hardware_counter_features(target_features)
     candidate = _hardware_counter_features(candidate_features)
     base_report = evaluate_priority_constraints(target, candidate)
@@ -421,16 +371,6 @@ def _relaxed_constraint_report(
     patched_report["weighted_violations_by_priority"] = w_violations_by_p
     patched_report["weighted_overflow_by_priority"] = w_overflow_by_p
     return patched_report
-
-
-def _constraint_row(
-    constraint_report: dict[str, Any],
-    feature_name: str,
-) -> dict[str, Any]:
-    for row in list(constraint_report.get("feature_rows") or []):
-        if str(row.get("feature_name", "")).strip() == str(feature_name):
-            return row
-    return {}
 
 
 def _priority_tier_view(
@@ -519,10 +459,6 @@ def _locked_objective_priority_rank(
         return current_priority_rank
     if current_priority_rank is None:
         return locked_priority_rank if not feature_rows else None
-    # If the locked rank has been forcibly escalated past the natural tier
-    # (e.g., tier escalation advanced rank 1→2 even though rank 1 isn't
-    # fully solved), honour the escalated rank so the prompt and evaluation
-    # target the correct lower tier.
     if locked_priority_rank > current_priority_rank:
         return locked_priority_rank
     if current_priority_rank < locked_priority_rank:
@@ -537,10 +473,6 @@ def _locked_objective_priority_rank(
     return current_priority_rank
 
 
-# ── Solved-tier feature protection ──────────────────────────────────────────
-# Maximum allowed *worsening* of relative error for features in already-solved
-# tiers when promoting a candidate that targets a lower tier.  This prevents
-# tier oscillation where T1 exploration undoes T0 gains.
 SOLVED_TIER_MAX_REGRESSION = float(os.environ.get("CLOUD_SOLVED_TIER_MAX_REGRESSION", "0.03"))
 
 
@@ -656,9 +588,6 @@ def _ipc_guardrail_report(
     tolerance_ratio = float(ipc_constraint.tolerance_ratio) if ipc_constraint is not None else 0.05
     anchor_gap = _feature_relative_gap(canonical_target, anchor_features, "perf_stat.IPC")
     candidate_gap = _feature_relative_gap(canonical_target, candidate_features, "perf_stat.IPC")
-    # When IPC-cache/branch coupling is detected the seed is compute-bound and
-    # all early candidates will have IPC far above target.  Use a very generous
-    # ceiling: accept anything that does not *worsen* IPC relative to the anchor.
     if ipc_coupled and not STRICT_IPC_GUARDRAIL:
         max_allowed_gap = max(
             (anchor_gap or 0.0) + 0.10,
@@ -684,9 +613,6 @@ def _ipc_guardrail_report(
             reason_parts.append(
                 f"IPC relative error {candidate_gap * 100.0:.2f}% exceeded the hard ceiling of {max_allowed_gap * 100.0:.2f}%."
             )
-        # When coupled, skip the worsening check entirely — early candidates
-        # will have IPC above the anchor and that is expected; the loop needs
-        # them accepted so it can iteratively add stalls.
         if (not ipc_coupled or STRICT_IPC_GUARDRAIL) and anchor_gap is not None and candidate_gap > anchor_gap + IPC_GUARDRAIL_MAX_WORSENING + 1e-12:
             passed = False
             reason_parts.append(
@@ -752,12 +678,17 @@ def _jsonl_write(path: Path, rows: list[dict[str, Any]]) -> None:
 
 
 def _run_logged(cmd: list[str], log_path: Path, cwd: Path | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess[str]:
+    child_env = dict(os.environ if env is None else env)
+    child_env["PYTHONPATH"] = os.pathsep.join(
+        [str(REPO_ROOT), str(REPO_ROOT / "scripts")]
+        + ([child_env["PYTHONPATH"]] if child_env.get("PYTHONPATH") else [])
+    )
     label = log_path.stem
     print(f"[cloud-tuning] start {label}: {' '.join(cmd[:3])}", flush=True)
     proc = subprocess.Popen(
         cmd,
         cwd=str(cwd) if cwd else None,
-        env=env,
+        env=child_env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -798,152 +729,6 @@ def _run_logged(cmd: list[str], log_path: Path, cwd: Path | None = None, env: di
     return completed
 
 
-# ── Tournament helper ────────────────────────────────────────────────────────
-def _tournament_generate_compile(
-    *,
-    providers: list[str],
-    attempt_index: int,
-    attempt_id: str,
-    generate_cmd_base: list[str],
-    compile_cmd_base: list[str],
-    generated_name_base: str,
-    run_dir: Path,
-    working_state: dict[str, Any],
-    retry_feedback: str,
-    retry_feedback_path: Path,
-    compile_budget_s: float | None,
-    cumulative_token_usage: dict[str, int],
-    binary_path: Path | None = None,
-    variant_lessons_text: str = "",
-) -> list[dict[str, Any]]:
-    """Run generate + compile for each provider and return per-provider results.
-
-    When *binary_path* is given, each successfully compiled binary is backed up
-    to ``<binary_path>__<provider>`` so that the main loop can restore it before
-    evaluation (the next provider's compile would otherwise overwrite the same
-    file).
-
-    Each element in the returned list has keys:
-        provider, generated_name, generate_rc, compile_record,
-        compile_rc, token_usage, attempt_id_tag, binary_backup (Path | None)
-    A provider that fails generate or compile will have compile_record={}.
-    """
-    results: list[dict[str, Any]] = []
-    for pidx, provider in enumerate(providers):
-        tag = f"{attempt_id}__{provider}"
-        gen_name = f"{tag}_candidate.patch"
-        env = _build_provider_env(provider)
-
-        # --- Generate ---
-        gen_cmd = list(generate_cmd_base)
-        # Swap the --output value to the per-provider patch name.
-        try:
-            out_idx = gen_cmd.index("--output")
-            gen_cmd[out_idx + 1] = gen_name
-        except (ValueError, IndexError):
-            gen_cmd.extend(["--output", gen_name])
-        if retry_feedback or variant_lessons_text:
-            gen_cmd.extend(["--retry-feedback-file", str(retry_feedback_path)])
-
-        gen_proc = _run_logged(
-            gen_cmd,
-            run_dir / f"02_generate_attempt_{attempt_index}_{provider}.json",
-            cwd=FOLLY_EDIT_RAG_SCRIPTS,
-            env=env,
-        )
-        gen_token_path = _PATCHES_DIR / f"{gen_name}.token_usage.json"
-        gen_token_usage = _read_token_usage_sidecar(gen_token_path)
-        _accumulate_token_usage(cumulative_token_usage, gen_token_usage)
-
-        if gen_proc.returncode != 0:
-            results.append({
-                "provider": provider,
-                "generated_name": gen_name,
-                "generate_rc": gen_proc.returncode,
-                "compile_record": {},
-                "compile_rc": -1,
-                "token_usage": gen_token_usage,
-                "attempt_id_tag": tag,
-                "stage_failed": "generate",
-            })
-            print(
-                f"[cloud-tuning] tournament: {provider} generation failed (rc={gen_proc.returncode})",
-                flush=True,
-            )
-            continue
-
-        # --- Compile ---
-        cmp_cmd = list(compile_cmd_base)
-        # Swap --patch-file and --example-id to per-provider values.
-        try:
-            pf_idx = cmp_cmd.index("--patch-file")
-            cmp_cmd[pf_idx + 1] = gen_name
-        except (ValueError, IndexError):
-            pass
-        try:
-            eid_idx = cmp_cmd.index("--example-id")
-            cmp_cmd[eid_idx + 1] = tag
-        except (ValueError, IndexError):
-            pass
-        if compile_budget_s is not None:
-            cmp_cmd.extend(["--wall-clock-budget-s", f"{compile_budget_s:.1f}"])
-        cmp_proc = _run_logged(
-            cmp_cmd,
-            run_dir / f"03_compile_attempt_{attempt_index}_{provider}.json",
-            cwd=FOLLY_EDIT_RAG_SCRIPTS,
-            env=env,
-        )
-        cmp_token_path = _COMPILE_LOGS_DIR / f"{tag}.token_usage.json"
-        cmp_token_usage = _read_token_usage_sidecar(cmp_token_path)
-        _accumulate_token_usage(cumulative_token_usage, cmp_token_usage)
-
-        cmp_log = FOLLY_EDIT_RAG_SCRIPTS / "outputs" / "compile_logs" / f"{tag}.json"
-        try:
-            cmp_record = json.loads(cmp_log.read_text(encoding="utf-8")) if cmp_log.exists() else {}
-        except (json.JSONDecodeError, OSError):
-            cmp_record = {}
-
-        merged_token = {
-            k: gen_token_usage.get(k, 0) + cmp_token_usage.get(k, 0)
-            for k in ("input_tokens", "output_tokens", "total_tokens", "call_count")
-        }
-        # Back up the compiled binary so the next provider doesn't overwrite it.
-        binary_backup: Path | None = None
-        if cmp_record.get("success") and binary_path is not None and binary_path.exists():
-            binary_backup = binary_path.with_name(f"{binary_path.name}__{provider}")
-            try:
-                shutil.copy2(str(binary_path), str(binary_backup))
-            except OSError as exc:
-                print(
-                    f"[cloud-tuning] tournament: WARNING: failed to back up binary for {provider}: {exc}",
-                    flush=True,
-                )
-                binary_backup = None
-
-        results.append({
-            "provider": provider,
-            "generated_name": gen_name,
-            "generate_rc": gen_proc.returncode,
-            "compile_record": cmp_record,
-            "compile_rc": cmp_proc.returncode,
-            "token_usage": merged_token,
-            "attempt_id_tag": tag,
-            "stage_failed": "" if cmp_record.get("success") else "compile",
-            "binary_backup": binary_backup,
-        })
-        if cmp_record.get("success"):
-            print(
-                f"[cloud-tuning] tournament: {provider} compiled successfully",
-                flush=True,
-            )
-        else:
-            print(
-                f"[cloud-tuning] tournament: {provider} compilation failed",
-                flush=True,
-            )
-    return results
-
-
 def _load_feature_table(xlsx_path: Path = DEFAULT_XLSX) -> pd.DataFrame:
     return load_feature_table(xlsx_path)
 
@@ -952,10 +737,6 @@ def _threshold_met(constraint_report: dict[str, Any], weighted_error: float) -> 
     checked_feature_count = int(constraint_report.get("checked_feature_count", 0) or 0)
     if checked_feature_count > 0 and bool(constraint_report.get("all_within_tolerance")):
         return True
-    # Fall back to the weighted-error gate so that a low weighted error
-    # (e.g. after the target-proportional scale floor) can declare success
-    # even when individual features still overflow their per-feature tolerance.
-    # This lets segments exit early and free budget for later segments.
     return float(weighted_error) <= MATCH_ERROR_THRESHOLD
 
 
@@ -1318,14 +1099,7 @@ def _coupled_evaluation_selection_key(
     evaluation: dict[str, Any],
     canonical_target: dict[str, float],
 ) -> tuple[Any, ...]:
-    """Selection key for IPC-cache/branch coupled runs.
-
-    The primary criterion is weighted error (base_error) so the best
-    overall candidate wins.  IPC proximity and coupled-feature gaps
-    serve only as tiebreakers when weighted errors are close (within
-    1e-3).  This prevents discarding high-accuracy attempts just
-    because a competitor has marginally better IPC.
-    """
+    'Selection key for IPC-cache/branch coupled runs.'
     base_error = _selection_error(evaluation)
     if not math.isfinite(base_error):
         return (float("inf"),) * 11
@@ -1389,12 +1163,7 @@ def _update_per_feature_best(
     *,
     ipc_coupled: bool = False,
 ) -> bool:
-    """Update per-feature best-ever accuracy tracker. Return True if any feature improved.
-
-    When *ipc_coupled* is True, only the coupled features (IPC + cache/branch
-    MPKI) are tracked so that irrelevant per-feature noise does not prevent
-    stagnation detection.
-    """
+    'Update per-feature best-ever accuracy tracker. Return True if any feature improved.'
     any_improved = False
     eps = 1e-12
     for feat, target_val in canonical_target.items():
@@ -1448,9 +1217,6 @@ def _stagnation_stop_reason(
     if attempt_index < effective_min_attempts:
         return ""
 
-    # ── Hard stagnation: no improvement for an extended window, regardless of
-    #    how "far" the source is from the target.  This catches scenarios where
-    #    the source appears close but the adjustor cannot improve accuracy.
     extended_window = STAGNANT_ATTEMPT_WINDOW * 2
     if (
         attempt_index - last_material_improvement_attempt >= extended_window
@@ -1567,10 +1333,6 @@ def _build_variant_lesson(
     }
 
 
-# Feature pairs that have conflicting data-size or throughput requirements.
-# If both are violated, from-scratch regeneration is unlikely to help because
-# the conflict is inherent — iterative refinement with explicit two-tier
-# strategies is more productive.
 _CONFLICTING_FROM_SCRATCH_PAIRS: tuple[tuple[str, str], ...] = (
     ("perf_stat.L1-dcache-load-misses_MPKI", "perf_stat.LLC-load-misses_MPKI"),
     ("perf_stat.L1-dcache-load-misses_MPKI", "perf_stat.IPC"),
@@ -1893,10 +1655,6 @@ def _promote_working_state(
     current_features = current_state.get("current_features") or {}
     old_ipc_gap = _feature_relative_gap(canonical_target, current_features, "perf_stat.IPC")
     new_ipc_gap = _feature_relative_gap(canonical_target, candidate_features, "perf_stat.IPC")
-    previous_rank_key = _normalized_rank_key(current_state.get("current_rank_key"))
-    candidate_eval_rank_key = _normalized_rank_key(evaluation.get("best_candidate_rank_key"))
-    previous_error = previous_rank_key[-1]
-    candidate_error = candidate_eval_rank_key[-1]
     objective_report = evaluation.get("objective_tier_report") or {}
     objective_label = str(
         objective_report.get("objective_tier_label")
@@ -1947,12 +1705,7 @@ def _ipc_guardrail_retry_feedback(
     evaluation: dict[str, Any],
     canonical_target: dict[str, float] | None = None,
 ) -> str:
-    """Build retry feedback when all candidates failed the IPC guardrail.
-
-    Extracts measured features from candidate_evaluations and, when the
-    IPC-cache/branch coupling is present, gives explicit guidance that
-    adding memory stalls and unpredictable branches will fix IPC too.
-    """
+    'Build retry feedback when all candidates failed the IPC guardrail.'
     candidate_evals = list(evaluation.get("candidate_evaluations") or [])
     # Pick the candidate closest to target overall.
     best_ce: dict[str, Any] | None = None
@@ -2192,7 +1945,6 @@ def _build_attempt_retry_feedback(
             f"do not reuse any existing `--bm_list` benchmark name, and do not introduce any other new benchmark registrations. {reason}"
         )
 
-    # ── IPC guardrail failure: extract measured features from candidate_evaluations ──
     if reason == "No new microbenchmark satisfied the IPC guardrail.":
         ipc_feedback = _ipc_guardrail_retry_feedback(
             task_payload, attempt_index, evaluation,
@@ -2220,7 +1972,6 @@ def _build_attempt_retry_feedback(
         locked_priority_rank=locked_priority_rank,
     )
     active_priority_rank = tier_state.get("active_priority_rank")
-    prioritized_rows = _corrective_feature_rows(feature_rows, freeze_ipc=ipc_frozen)
     violated_rows = [
         row
         for row in list(tier_state.get("guardrail_violated_rows") or []) + list(tier_state.get("active_focus_rows") or [])
@@ -2401,10 +2152,6 @@ def _evaluate_adjusted_binary(
     application_runtime_failure_reasons: list[str] = []
     best_ipc_guardrail_report: dict[str, Any] | None = None
     best_objective_report: dict[str, Any] | None = None
-    # Track the best candidate that improved the active tier but was rejected
-    # by the IPC guardrail.  Surfaced as "ipc_rejected_tier_hint" so the next
-    # attempt can reuse the tier-improving code changes while focusing the LLM
-    # on an IPC-safe variant of those changes.
     _best_ipc_rejected_tier_candidate: dict[str, Any] | None = None
     _best_ipc_rejected_tier_error: float = float("inf")
 
@@ -2522,9 +2269,6 @@ def _evaluate_adjusted_binary(
             candidate_features=candidate_features,
             ipc_coupled=ipc_coupled,
         )
-        # Adaptive tolerance: when stuck at a T1+ tier for several
-        # consecutive attempts, evaluate the objective-tier improvement
-        # with relaxed tolerances so marginal gains are accepted.
         _use_adaptive = (
             tier_stagnation_attempts >= ADAPTIVE_TIER_STAGNATION_WINDOW
             and objective_priority_rank is not None
@@ -2566,11 +2310,6 @@ def _evaluate_adjusted_binary(
                 )
         ipc_guardrail_passed = bool(ipc_guardrail_report.get("passed"))
         objective_tier_improved = bool(objective_report.get("passed"))
-        # When IPC-cache/branch coupling is active, relax acceptance: accept
-        # any candidate that passes the (already widened) IPC guardrail, even
-        # if the objective tier score hasn't improved yet — early coupled
-        # candidates will overshoot IPC but we need them accepted so the loop
-        # can iterate toward lower IPC with stall patterns.
         if ipc_coupled:
             selection_eligible = ipc_guardrail_passed
         else:
@@ -2598,9 +2337,6 @@ def _evaluate_adjusted_binary(
                 rejection_reasons.append(str(objective_report.get("reason", "")).strip())
             candidate_eval["reason"] = " ".join(part for part in rejection_reasons if part).strip()
             evaluation["candidate_evaluations"].append(candidate_eval)
-            # Capture tier-improving candidates rejected only by the IPC
-            # guardrail so the next attempt can build on their tier gains
-            # while correcting IPC.
             if not ipc_guardrail_passed and objective_tier_improved and current_error < _best_ipc_rejected_tier_error:
                 _best_ipc_rejected_tier_error = current_error
                 _best_ipc_rejected_tier_candidate = {
@@ -2854,10 +2590,6 @@ def _binary_subject(binary_name: str) -> str:
     return subject.replace("_", " ").strip()
 
 
-def _direction_phrase(direction: str) -> str:
-    return "increase" if direction == "increase" else "decrease"
-
-
 def _task_bounds(scale: float, magnitude: str) -> tuple[float, float | None, float]:
     lower_factor, upper_factor = MAGNITUDE_BANDS[magnitude]
     return (
@@ -2884,77 +2616,6 @@ def _style_anchors(binary_name: str, microbenchmark_name: str) -> list[str]:
     if not isinstance(anchors, list):
         return []
     return [str(anchor) for anchor in anchors if str(anchor).strip()]
-
-
-def _target_range_fragment(
-    feature_name: str,
-    target_value: float,
-    *,
-    include_label: bool = True,
-) -> str:
-    feature_label = feature_display_name(feature_name)
-    constraint = feature_constraint(feature_name)
-    if constraint is None:
-        return f"{feature_label}={target_value:.6g}" if include_label else f"{target_value:.6g}"
-    acceptable_min, acceptable_max = tolerance_bounds(target_value, constraint.tolerance_ratio)
-    prefix = f"{feature_label} target={target_value:.6g}" if include_label else f"target={target_value:.6g}"
-    return (
-        f"{prefix} (acceptable {acceptable_min:.6g} to {acceptable_max:.6g}, "
-        f"+/-{constraint.tolerance_ratio * 100:.0f}%)"
-    )
-
-
-def _secondary_hardware_clause(
-    *,
-    top_feature_gaps: list[dict[str, Any]],
-    primary_feature_name: str,
-) -> str:
-    secondary_rows = [
-        row
-        for row in top_feature_gaps
-        if str(row.get("feature_name")) != primary_feature_name
-        and str(row.get("feature_name", "")).startswith("perf_stat.")
-    ][:2]
-    if not secondary_rows:
-        return ""
-
-    fragments: list[str] = []
-    for row in secondary_rows:
-        feature_name = str(row["feature_name"])
-        feature_label = feature_display_name(feature_name)
-        baseline_value = float(row["baseline_value"])
-        target_value = float(row["target_value"])
-        fragments.append(
-            f"{feature_label}: baseline={baseline_value:.6g}, {_target_range_fragment(feature_name, target_value, include_label=False)}"
-        )
-    return (
-        " Also track these additional hardware counters directionally in this first attempt, in priority order: "
-        + "; ".join(fragments)
-        + ". Treat any remaining counters as directional only for now rather than trying to satisfy every counter in one shot."
-    )
-
-
-def _bounded_delta_clause(
-    feature_name: str,
-    *,
-    current_value: float,
-    target_value: float,
-) -> str:
-    feature_label = feature_display_name(feature_name)
-    delta = target_value - current_value
-    direction = "increase" if delta >= 0 else "decrease"
-    constraint = feature_constraint(feature_name)
-    if constraint is None:
-        return (
-            f" Use a bounded first-step change: {direction} {feature_label} from {current_value:.6g} "
-            f"toward {target_value:.6g} (delta {delta:+.6g}) without dramatically changing the benchmark character."
-        )
-    acceptable_min, acceptable_max = tolerance_bounds(target_value, constraint.tolerance_ratio)
-    return (
-        f" Use a bounded first-step change: {direction} {feature_label} from {current_value:.6g} toward "
-        f"{target_value:.6g} (delta {delta:+.6g}), aim to stay inside {acceptable_min:.6g} to {acceptable_max:.6g}, "
-        f"and avoid overshooting by dramatically changing the hot-path footprint or benchmark character."
-    )
 
 
 def _benchmark_family_base(source_microbenchmark: str) -> str:
@@ -3122,37 +2783,6 @@ def _registration_idiom_clause(target_file_path: Path) -> str:
     return ""
 
 
-def _initial_step_priority_clause(
-    *,
-    top_feature_gaps: list[dict[str, Any]],
-    primary_feature_name: str,
-) -> str:
-    ordered: list[str] = []
-
-    def add(feature_name: str) -> None:
-        if feature_name and feature_name not in ordered:
-            ordered.append(feature_name)
-
-    add(primary_feature_name)
-    add("perf_stat.IPC")
-    for row in top_feature_gaps:
-        feature_name = str(row.get("feature_name", "")).strip()
-        if str(row.get("feature_name", "")).startswith("perf_stat."):
-            add(feature_name)
-        if len(ordered) >= 3:
-            break
-
-    labels = [feature_display_name(feature_name) for feature_name in ordered[:3] if feature_name]
-    if not labels:
-        return ""
-    numbered = [f"{idx}. {label}" for idx, label in enumerate(labels, start=2)]
-    return (
-        " In this first attempt, optimize in order: 1. buildability; "
-        + "; ".join(numbered)
-        + ". Treat all remaining counters as directional only in this attempt."
-    )
-
-
 def _prompt_hardware_feature_rows(feature_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         row
@@ -3224,8 +2854,6 @@ def _measurement_lines(
     return lines
 
 
-# ── Coupling helpers for iterative correction ──────────────────────────
-
 _COUPLING_CACHE_BRANCH_FEATURES = {
     "perf_stat.L1-dcache-load-misses_MPKI",
     "perf_stat.LLC-load-misses_MPKI",
@@ -3235,13 +2863,7 @@ _COUPLING_CACHE_BRANCH_FEATURES = {
 
 
 def _iterative_coupling_detected(by_name: dict[str, dict]) -> bool:
-    """Return True when measured candidate features show IPC-cache/branch coupling.
-
-    Coupling means IPC is well above target AND multiple cache/branch counters
-    are far below target.  This mirrors _ipc_cache_branch_coupled() but works
-    from the measured *candidate* rows (by_name) rather than pre-computed
-    top_feature_gaps.
-    """
+    'Return True when measured candidate features show IPC-cache/branch coupling.'
     ipc_row = by_name.get("perf_stat.IPC")
     if not ipc_row:
         return False
@@ -3473,117 +3095,6 @@ def _metric_status(row: dict[str, Any]) -> str:
     return "within range"
 
 
-def _row_accuracy_pct(row: dict[str, Any]) -> float | None:
-    return _relative_accuracy_pct(row.get("target_value"), row.get("candidate_value"))
-
-
-def _ipc_cause_summary(by_name: dict[str, dict[str, Any]], *, status: str) -> str:
-    if status == "too high":
-        cause_fragments: list[str] = []
-        cause_candidates = [
-            ("perf_stat.L1-icache-load-misses_MPKI", "frontend instruction footprint is still too compact or regular"),
-            ("perf_stat.branch-misses_MPKI", "branch prediction is still too successful"),
-            ("perf_stat.branch-load-misses_MPKI", "hot branch target complexity is still too small"),
-            ("perf_stat.L1-dcache-loads_LPKI", "memory read traffic is still too light"),
-            ("perf_stat.L1-dcache-stores_SPKI", "memory write traffic is still too light"),
-            ("perf_stat.L1-dcache-load-misses_MPKI", "locality is still too strong"),
-        ]
-        for feature_name, fragment in cause_candidates:
-            row = by_name.get(feature_name)
-            if row and _metric_status(row) == "too low":
-                cause_fragments.append(fragment)
-        if not cause_fragments:
-            cause_fragments.append("execution remains too efficient overall in the dominant subsystem")
-        return "IPC is still too high because " + "; ".join(cause_fragments[:3]) + "."
-    if status == "too low":
-        return "IPC is already too low because the hot path has too much stall time, dependency depth, or extra work."
-    return "IPC is within range and should be protected."
-
-
-def _microarchitectural_cause_line(
-    row: dict[str, Any],
-    *,
-    by_name: dict[str, dict[str, Any]],
-) -> str:
-    feature_name = str(row.get("feature_name", "")).strip()
-    label = feature_display_name(feature_name)
-    status = _metric_status(row)
-    if feature_name == "perf_stat.IPC":
-        return f"- {label}: {_ipc_cause_summary(by_name, status=status)}"
-    if feature_name == "perf_stat.branch-misses_MPKI":
-        mapping = {
-            "too low": "the branch predictor is learning the hot path too well.",
-            "too high": "the hot path has too much branch entropy or too many unpredictable decisions.",
-            "within range": "branch predictor pressure is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'branch behavior is outside tolerance.')}"
-    if feature_name == "perf_stat.branch-load-misses_MPKI":
-        mapping = {
-            "too low": "the hot branch/target footprint is still too compact and the BTB is under-stressed.",
-            "too high": "the branch target working set is too large or too chaotic.",
-            "within range": "branch-target pressure is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'branch target behavior is outside tolerance.')}"
-    if feature_name == "perf_stat.L1-icache-load-misses_MPKI":
-        mapping = {
-            "too low": "the hot instruction footprint is too compact or too regular.",
-            "too high": "the hot instruction footprint is too large or too fragmented.",
-            "within range": "frontend instruction footprint is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'instruction-cache behavior is outside tolerance.')}"
-    if feature_name in {"perf_stat.L1-dcache-loads_LPKI", "perf_stat.L1-dcache-stores_SPKI"}:
-        traffic_kind = "read" if "loads" in feature_name else "write"
-        mapping = {
-            "too low": f"the hot path is touching too little data and generating too little {traffic_kind} traffic.",
-            "too high": f"the hot path is generating too much {traffic_kind} traffic or too many state touches.",
-            "within range": f"{traffic_kind.capitalize()} traffic is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'L1D traffic is outside tolerance.')}"
-    if feature_name == "perf_stat.L1-dcache-load-misses_MPKI":
-        mapping = {
-            "too low": "locality is too strong or the hot data footprint is too small.",
-            "too high": "locality is too weak or the working set is too scattered.",
-            "within range": "L1D miss pressure is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'L1D miss behavior is outside tolerance.')}"
-    if feature_name == "perf_stat.iTLB-load-misses_MPKI":
-        mapping = {
-            "too low": "the hot instruction footprint spans too few instruction pages.",
-            "too high": "the hot code is spread across too many instruction pages.",
-            "within range": "instruction-page footprint is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'iTLB behavior is outside tolerance.')}"
-    if feature_name == "tma.TMA_Frontend_Bound(%)":
-        mapping = {
-            "too low": "frontend pressure is too weak.",
-            "too high": "frontend stalls are too strong.",
-            "within range": "frontend-bound behavior is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'frontend-bound behavior is outside tolerance.')}"
-    if feature_name == "tma.TMA_Backend_Bound(%)":
-        mapping = {
-            "too low": "backend pressure is too weak and the hot path is still too efficient.",
-            "too high": "backend stalls are already too strong.",
-            "within range": "backend-bound behavior is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'backend-bound behavior is outside tolerance.')}"
-    if feature_name == "tma.TMA_Bad_Speculation(%)":
-        mapping = {
-            "too low": "misprediction/speculation pressure is too weak.",
-            "too high": "speculation waste is already too strong.",
-            "within range": "bad speculation is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'bad-speculation behavior is outside tolerance.')}"
-    if feature_name == "tma.TMA_Retiring(%)":
-        mapping = {
-            "too low": "too little useful work is retiring relative to target.",
-            "too high": "the benchmark is still retiring too much useful work and not stalling enough.",
-            "within range": "retiring share is already close to target and should be preserved.",
-        }
-        return f"- {label}: {mapping.get(status, 'retiring share is outside tolerance.')}"
-    return f"- {label}: likely subsystem cause needs correction in the dominant hot-path mechanism."
-
-
 def _recommended_transformations(
     feature_name: str,
     *,
@@ -3714,127 +3225,6 @@ def _recommended_transformations(
     return (
         "Choose one minimal local transformation that targets the dominant subsystem cause without rewriting the benchmark.",
         "Preserve metrics already close to target.",
-    )
-
-
-def _reasoning_protocol_sections(
-    *,
-    feature_rows: list[dict[str, Any]],
-    primary_feature_name: str,
-    include_within_range: bool = False,
-    freeze_ipc: bool = False,
-) -> dict[str, str]:
-    feature_rows = _prompt_hardware_feature_rows(feature_rows)
-    by_name = {str(row.get("feature_name", "")).strip(): row for row in feature_rows}
-    prioritized_rows = _corrective_feature_rows(feature_rows, freeze_ipc=freeze_ipc)
-    ordered_rows: list[dict[str, Any]] = []
-    if "perf_stat.IPC" in by_name and not freeze_ipc:
-        ordered_rows.append(by_name["perf_stat.IPC"])
-    if primary_feature_name and primary_feature_name in by_name and primary_feature_name != "perf_stat.IPC":
-        ordered_rows.append(by_name[primary_feature_name])
-    for row in prioritized_rows:
-        if row in ordered_rows:
-            continue
-        if include_within_range or not bool(row.get("within_tolerance")):
-            ordered_rows.append(row)
-        if len(ordered_rows) >= 5:
-            break
-
-    what_lines: list[str] = []
-    for row in ordered_rows[:5]:
-        feature_name = str(row.get("feature_name", "")).strip()
-        label = feature_display_name(feature_name)
-        status = _metric_status(row)
-        target_value = row.get("target_value")
-        candidate_value = row.get("candidate_value")
-        tolerance_ratio = row.get("tolerance_ratio")
-        if tolerance_ratio is not None:
-            try:
-                acceptable_min, acceptable_max = tolerance_bounds(float(target_value), float(tolerance_ratio))
-                what_lines.append(
-                    f"- {label}: {status} (current={candidate_value}, target={target_value}, acceptable={acceptable_min:.6g}..{acceptable_max:.6g})"
-                )
-                continue
-            except (TypeError, ValueError):
-                pass
-        what_lines.append(f"- {label}: {status} (current={candidate_value}, target={target_value})")
-
-    why_lines = [_microarchitectural_cause_line(row, by_name=by_name) for row in ordered_rows[:4]]
-
-    branch_rows = [
-        row
-        for row in [
-            by_name.get("perf_stat.branch-misses_MPKI"),
-            by_name.get("perf_stat.branch-load-misses_MPKI"),
-        ]
-        if row
-    ]
-    branch_overshoot = any(_metric_status(row) == "too high" for row in branch_rows)
-    primary_row = by_name.get(primary_feature_name) or (ordered_rows[0] if ordered_rows else {})
-    primary_fix, secondary_fix = _recommended_transformations(
-        str(primary_row.get("feature_name", "")).strip(),
-        status=_metric_status(primary_row) if primary_row else "out of range",
-        by_name=by_name,
-        branch_overshoot=branch_overshoot,
-    )
-    how_lines = [f"- Primary transformation: {primary_fix}"]
-    if secondary_fix:
-        how_lines.append(f"- Optional secondary transformation: {secondary_fix}")
-
-    protected_candidates = [
-        row
-        for row in feature_rows
-        if bool(row.get("within_tolerance")) or (_row_accuracy_pct(row) or 0.0) >= 80.0
-    ]
-    protected_lines: list[str] = []
-    seen: set[str] = set()
-    for row in protected_candidates:
-        feature_name = str(row.get("feature_name", "")).strip()
-        if not feature_name or feature_name in seen:
-            continue
-        seen.add(feature_name)
-        protected_lines.append(
-            f"- {feature_display_name(feature_name)} should remain stable (current accuracy {(_row_accuracy_pct(row) or 0.0):.1f}%)."
-        )
-        if len(protected_lines) >= 4:
-            break
-    if not protected_lines:
-        protected_lines.append("- No metric is safely converged yet; avoid broad rewrites anyway.")
-
-    return {
-        "WHAT_IS_WRONG": "\n".join(what_lines) if what_lines else "- No out-of-range metrics identified.",
-        "WHY_IT_IS_WRONG": "\n".join(why_lines) if why_lines else "- No dominant subsystem cause identified yet.",
-        "HOW_TO_FIX_IT": "\n".join(how_lines),
-        "PROTECTED_METRICS": "\n".join(protected_lines),
-    }
-
-
-def _reasoning_protocol_block(
-    *,
-    feature_rows: list[dict[str, Any]],
-    primary_feature_name: str,
-    include_within_range: bool = False,
-    freeze_ipc: bool = False,
-) -> str:
-    sections = _reasoning_protocol_sections(
-        feature_rows=feature_rows,
-        primary_feature_name=primary_feature_name,
-        include_within_range=include_within_range,
-        freeze_ipc=freeze_ipc,
-    )
-    return (
-        "Required internal reasoning protocol before writing code (do not include these headings in your output):\n"
-        "Treat counter gaps as symptoms; fix the underlying subsystem cause, not the number directly.\n"
-        "Separate diagnosis from repair. First identify what is wrong relative to target, then infer the likely "
-        "microarchitectural cause, then choose the smallest code transformation that addresses that cause without damaging already-good metrics.\n\n"
-        "WHAT_IS_WRONG\n"
-        f"{sections['WHAT_IS_WRONG']}\n\n"
-        "WHY_IT_IS_WRONG\n"
-        f"{sections['WHY_IT_IS_WRONG']}\n\n"
-        "HOW_TO_FIX_IT\n"
-        f"{sections['HOW_TO_FIX_IT']}\n\n"
-        "PROTECTED_METRICS\n"
-        f"{sections['PROTECTED_METRICS']}"
     )
 
 
@@ -3987,16 +3377,7 @@ def _ipc_cache_branch_coupled(
     top_feature_gaps: list[dict[str, Any]],
     freeze_ipc: bool,
 ) -> bool:
-    """Detect the IPC-cache/branch coupling scenario.
-
-    Returns True when cache/branch MPKIs are far below target AND
-    either (a) IPC is frozen (within tolerance — baseline IPC ≈ target
-    but generated code will be compute-bound) or (b) IPC baseline is
-    well above target (code is too fast and needs stalls).  In both
-    regimes adding memory stalls and branch unpredictability is the
-    mechanism to bring IPC down AND match cache/branch counters
-    simultaneously.
-    """
+    'Detect the IPC-cache/branch coupling scenario.'
     coupled_count = 0
     ipc_baseline: float | None = None
     ipc_target: float | None = None
@@ -4253,26 +3634,6 @@ def _compact_diagnosis_lines(
     return lines
 
 
-def _compact_cause_lines(
-    *,
-    top_feature_gaps: list[dict[str, Any]],
-    primary_feature_name: str,
-) -> list[str]:
-    protocol_rows = _task_protocol_rows(top_feature_gaps)
-    by_name = {str(row.get("feature_name", "")).strip(): row for row in protocol_rows}
-    lines: list[str] = []
-    for feature_name in _task_priority_feature_names(
-        top_feature_gaps=top_feature_gaps,
-        primary_feature_name=primary_feature_name,
-        max_features=4,
-    ):
-        row = by_name.get(feature_name)
-        if not row:
-            continue
-        lines.append(_microarchitectural_cause_line(row, by_name=by_name))
-    return lines[:4]
-
-
 def _adapt_strategy_language(text: str, *, from_scratch: bool) -> str:
     rendered = str(text or "").strip()
     if not rendered or not from_scratch:
@@ -4504,75 +3865,6 @@ def _supplemental_feature_guidance_lines(
     return lines
 
 
-def _iterative_regime_guidance(
-    *,
-    task_payload: dict[str, Any],
-    best_constraint_report: dict[str, Any],
-) -> str:
-    feature_rows = list(best_constraint_report.get("feature_rows") or [])
-    if not feature_rows:
-        return ""
-    by_name = {str(row.get("feature_name", "")).strip(): row for row in feature_rows}
-    ipc_row = by_name.get("perf_stat.IPC")
-    if not ipc_row or bool(ipc_row.get("within_tolerance")):
-        return ""
-
-    primary_name = str(task_payload.get("feature_name", "")).strip()
-    top_feature_name = str(feature_rows[0].get("feature_name", "")).strip() if feature_rows else ""
-    ipc_rel_error = float(ipc_row.get("relative_error_pct") or 0.0)
-    if top_feature_name != "perf_stat.IPC" and primary_name != "perf_stat.IPC":
-        return ""
-    if ipc_rel_error < 20.0:
-        return ""
-
-    secondary_names = [
-        "perf_stat.L1-icache-load-misses_MPKI",
-        "perf_stat.branch-misses_MPKI",
-        "perf_stat.branch-load-misses_MPKI",
-        "perf_stat.L1-dcache-load-misses_MPKI",
-        "perf_stat.L1-dcache-loads_LPKI",
-        "perf_stat.L1-dcache-stores_SPKI",
-        "perf_stat.iTLB-load-misses_MPKI",
-    ]
-    secondary_rows = [by_name[name] for name in secondary_names if name in by_name]
-    close_rows = [
-        row
-        for row in secondary_rows
-        if bool(row.get("within_tolerance"))
-        or float(row.get("relative_error_pct") or 0.0) <= 30.0
-        or (_row_accuracy_pct(row) or 0.0) >= 70.0
-    ]
-    if len(close_rows) < 3:
-        return ""
-
-    branch_rows = [
-        row
-        for row in [
-            by_name.get("perf_stat.branch-misses_MPKI"),
-            by_name.get("perf_stat.branch-load-misses_MPKI"),
-        ]
-        if row
-    ]
-    branch_overshoot = any(
-        float(row.get("candidate_value") or 0.0) > float(row.get("target_value") or 0.0)
-        for row in branch_rows
-    )
-    branch_clause = (
-        " Branch metrics are already above target, so slightly soften branch intensity if needed rather than adding more branchy or icache-heavy machinery."
-        if branch_overshoot
-        else ""
-    )
-    return (
-        "Calibration guidance:\n"
-        "- Secondary HW shape is already partly correct while IPC remains the dominant miss.\n"
-        "- Preserve the current frontend, branch, and cache behavior that is already working.\n"
-        "- Do not add more helper fan-out, switch dispatch, large new code regions, or long arithmetic chains just to push IPC down.\n"
-        "- Make one minimal corrective patch that lowers IPC by increasing backend-bound stall time, preferably with one dependent memory-latency or load-use mechanism in the existing hot path.\n"
-        "- Prefer a small dependency chain or dependent load in the existing hot path over a broad rewrite of multiple hot regions."
-        f"{branch_clause}"
-    )
-
-
 def _build_property_task(
     *,
     binary_name: str,
@@ -4627,16 +3919,11 @@ def _build_property_task(
             source_microbenchmark,
             from_scratch=True,
         )
-    tolerance_clause = ""
     acceptable_min = None
     acceptable_max = None
     if constraint is not None:
         try:
             acceptable_min, acceptable_max = tolerance_bounds(target_value, constraint.tolerance_ratio)
-            tolerance_clause = (
-                f" Acceptable range for {feature_label} is {acceptable_min:.6g} to "
-                f"{acceptable_max:.6g} ({constraint.tolerance_ratio * 100:.0f}% around the target {target_value:.6g})."
-            )
         except (TypeError, ValueError):
             pass
     guidance_lines = _compact_feature_guidance_lines(feature_name, direction)
@@ -4889,7 +4176,7 @@ def run_cloud_tuning_attempt(
         "on",
     }
     started_at = time.monotonic()
-    from cloning_priority import get_priority_mode, priority_tier_label
+    from scripts.cloning_priority import get_priority_mode, priority_tier_label
     print(
         f"[cloud-tuning] priority mode: {get_priority_mode()} "
         f"(primary objective {priority_tier_label(1)})",
@@ -4978,9 +4265,6 @@ def run_cloud_tuning_attempt(
     delayed_from_scratch_mode = bool(
         baseline_low_hw and SEED_BASELINE_SELECTION_MODE == "ipc_near_non_ipc_hw"
     )
-    # Suppress from-scratch if the top misses involve conflicting features
-    # (e.g. L1-d vs LLC, branch vs IPC) — these are inherently hard to satisfy
-    # simultaneously and from-scratch regeneration loses prior progress.
     baseline_has_conflicting_features = _baseline_has_feature_coupling(
         baseline_constraint_report
     )
@@ -5043,12 +4327,6 @@ def run_cloud_tuning_attempt(
             "[cloud-tuning] IPC-cache/branch coupling detected, but strict IPC guardrail remains enforced.",
             flush=True,
         )
-    if TOURNAMENT_MODE:
-        print(
-            f"[cloud-tuning] TOURNAMENT MODE enabled: providers={TOURNAMENT_PROVIDERS}",
-            flush=True,
-        )
-
     forbidden_benchmark_names_path = run_dir / "baseline_benchmark_names.json"
     _json_write(
         forbidden_benchmark_names_path,
@@ -5116,7 +4394,6 @@ def run_cloud_tuning_attempt(
     early_stop_reason = ""
     retry_feedback = ""
     feature_guidance = "\n".join(task_payload.get("feature_specific_guidance", []))
-    # ── Variant tracking ────────────────────────────────────────────────────
     variant_index = 1
     variant_history: list[dict[str, Any]] = []
     variant_lessons_text = ""
@@ -5140,8 +4417,6 @@ def run_cloud_tuning_attempt(
         "carry_forward_reason": "",
     }
     local_eligible_candidate_seen = False
-    # ── Cross-segment warm-start: if a previous segment produced a better
-    #    candidate than the seed baseline, initialize from that code instead.
     if warm_start_file and warm_start_features and Path(warm_start_file).is_file():
         ws_canonical = canonicalize_feature_dict(warm_start_features)
         ws_report = _hardware_counter_match_report(canonical_target, ws_canonical, feature_scales)
@@ -5241,7 +4516,6 @@ def run_cloud_tuning_attempt(
             print(f"[cloud-tuning] {early_stop_reason}", flush=True)
             break
 
-        # ── Per-variant exhaustion: switch to a new variant ─────────
         if variant_attempt_count > MAX_ATTEMPTS_PER_VARIANT:
             stop_reason = (
                 f"Variant {variant_index} exhausted {MAX_ATTEMPTS_PER_VARIANT} attempts "
@@ -5263,7 +4537,7 @@ def run_cloud_tuning_attempt(
                 stop_reason=stop_reason,
             )
             variant_history.append(lesson)
-            variant_lessons_text = "\n\n".join(v["lesson_text"] for v in variant_history)
+            variant_lessons_text = "\n\n".join(v["lesson_text"] for v in variant_history[-3:])
             print(
                 f"[cloud-tuning] variant {variant_index} exhausted after "
                 f"{MAX_ATTEMPTS_PER_VARIANT} attempts. Switching to variant {variant_index + 1}.",
@@ -5543,11 +4817,6 @@ def run_cloud_tuning_attempt(
         if bool(task_payload.get("application_seed")):
             generate_cmd_base.append("--application-seed")
 
-        compile_budget_s = _available_step_budget_seconds(
-            deadline_monotonic,
-            reserve_seconds=REQUEST_BUDGET_SLACK_SECONDS + MIN_EVALUATE_BUDGET_SECONDS,
-        )
-
         compile_cmd_base = [
             sys.executable,
             str(FOLLY_EDIT_RAG_SCRIPTS / "05_apply_compile_repair.py"),
@@ -5580,346 +4849,181 @@ def run_cloud_tuning_attempt(
         if bool(task_payload.get("application_seed")):
             compile_cmd_base.append("--application-seed")
 
-        # ── Tournament vs single-provider branch ────────────────────
-        if TOURNAMENT_MODE and len(TOURNAMENT_PROVIDERS) >= 2:
-            # --- Tournament: generate + compile for each provider ---
-            tournament_results = _tournament_generate_compile(
-                providers=TOURNAMENT_PROVIDERS,
-                attempt_index=attempt_index,
-                attempt_id=attempt_id,
-                generate_cmd_base=generate_cmd_base,
-                compile_cmd_base=compile_cmd_base,
-                generated_name_base=generated_name,
-                run_dir=run_dir,
-                working_state=working_state,
-                retry_feedback=retry_feedback,
-                retry_feedback_path=retry_feedback_path,
-                compile_budget_s=compile_budget_s,
-                cumulative_token_usage=cumulative_token_usage,
-                binary_path=binary_path,
-                variant_lessons_text=variant_lessons_text,
-            )
-            attempt_record["tournament_results"] = [
-                {"provider": r["provider"], "generate_rc": r["generate_rc"],
-                 "compile_success": bool(r["compile_record"].get("success")),
-                 "stage_failed": r.get("stage_failed", ""),
-                 "token_usage": r["token_usage"]}
-                for r in tournament_results
-            ]
-            # Filter to providers that compiled successfully.
-            compiled_ok = [r for r in tournament_results if r["compile_record"].get("success")]
-            if not compiled_ok:
-                # All providers failed — pick the best failure info for retry feedback.
-                attempt_record["stage"] = "compile"
-                attempt_record["reason"] = (
-                    "Tournament: all providers failed to produce a compiling binary."
-                )
-                # Use the first provider's compile record for retry feedback.
-                first_result = tournament_results[0] if tournament_results else {}
-                compile_record = first_result.get("compile_record", {})
-                last_compile_record = compile_record
-                attempt_record["compile_record"] = compile_record
-                attempts.append(attempt_record)
-                retry_feedback = _build_attempt_retry_feedback(
-                    task_payload,
-                    attempt_index,
-                    objective_priority_rank=(
-                        int(working_state["objective_priority_rank"])
-                        if working_state.get("objective_priority_rank") is not None
-                        else None
-                    ),
-                    active_source_microbenchmark=str(working_state["active_source_microbenchmark"]),
-                    compile_record=compile_record,
-                    canonical_target=canonical_target,
-                )
-                print(
-                    f"[cloud-tuning] tournament attempt {attempt_index}: no provider compiled successfully",
-                    flush=True,
-                )
-                continue
-
-            # Evaluate each compiled provider and pick the winner.
-            # Restore the provider's backed-up binary before evaluation so we
-            # don't accidentally evaluate the last provider's binary for all.
-            provider_evaluations: list[tuple[dict[str, Any], dict[str, Any], dict[str, Any]]] = []
-            for prov_result in compiled_ok:
-                backup = prov_result.get("binary_backup")
-                if backup and Path(backup).exists():
-                    shutil.copy2(str(backup), str(binary_path))
-                prov_eval = _evaluate_adjusted_binary(
-                    run_dir=run_dir,
-                    attempt_index=attempt_index,
-                    binary_path=binary_path,
-                    binary_name=binary_name,
-                    source_microbenchmark=str(working_state["active_source_microbenchmark"]),
-                    baseline_binary_microbenchmarks=baseline_binary_microbenchmarks,
-                    canonical_target=canonical_target,
-                    feature_scales=feature_scales,
-                    anchor_features=dict(working_state["current_features"]),
-                    anchor_constraint_report=_hardware_counter_constraint_report(
-                        canonical_target,
-                        dict(working_state["current_features"]),
-                    ),
-                    objective_priority_rank=(
-                        int(working_state["objective_priority_rank"])
-                        if working_state.get("objective_priority_rank") is not None
-                        else None
-                    ),
-                    perf_events=perf_events,
-                    amd=amd,
-                    deadline_monotonic=deadline_monotonic,
-                    compile_record=prov_result["compile_record"],
-                    anchor_source_text=attempt_anchor_source_text,
-                    ipc_coupled=ipc_coupled,
-                )
-                provider_evaluations.append((prov_result, prov_eval, prov_result["compile_record"]))
-                prov_candidate = dict((prov_eval.get("best_candidate") or {}).get("features") or {})
-                prov_error = prov_eval.get("candidate_error")
-                prov_name = str((prov_eval.get("best_candidate") or {}).get("microbenchmark") or "(unknown)")
-                prov_tag = prov_result["provider"]
-                if prov_candidate:
-                    _print_live_accuracy(
-                        f"[cloud-tuning] tournament {prov_tag} attempt {attempt_index} candidate {prov_name}:",
-                        canonical_target,
-                        prov_candidate,
-                        float(prov_error) if prov_error is not None else None,
-                    )
-
-            # Pick winner: lowest selection key among those with finite error.
-            def _tournament_key(item: tuple[dict, dict, dict]) -> tuple:
-                _, ev, _ = item
-                if ipc_coupled:
-                    return _coupled_evaluation_selection_key(ev, canonical_target)
-                return _evaluation_selection_key(ev)
-
-            winner_result, evaluation, compile_record = min(
-                provider_evaluations,
-                key=_tournament_key,
-            )
-            attempt_record["tournament_winner"] = winner_result["provider"]
+        _two_phase_env: dict[str, str] | None = None
+        _tp_overrides = _two_phase_model_env(
+            int(working_state["objective_priority_rank"])
+            if working_state.get("objective_priority_rank") is not None
+            else None
+        )
+        if _tp_overrides:
+            _two_phase_env = dict(os.environ)
+            _two_phase_env.update(_tp_overrides)
             print(
-                f"[cloud-tuning] tournament attempt {attempt_index}: winner={winner_result['provider']}",
+                f"[cloud-tuning] two-phase model: using {_tp_overrides.get('VERTEX_MODEL_NAME', '?')} "
+                f"for tier objective {working_state.get('objective_priority_rank')}",
                 flush=True,
             )
-            # Log runner-up evaluations.
-            for prov_result_i, prov_eval_i, _ in provider_evaluations:
-                if prov_result_i is not winner_result:
-                    attempt_record.setdefault("tournament_runner_ups", []).append({
-                        "provider": prov_result_i["provider"],
-                        "candidate_error": prov_eval_i.get("candidate_error"),
-                    })
 
-            last_compile_record = compile_record
-            last_evaluation = evaluation
-            attempt_record["generate"] = {"returncode": 0, "tournament": True}
-            attempt_record["compile"] = {"returncode": 0, "tournament": True}
-            attempt_record["compile_record"] = compile_record
-            attempt_record["evaluation"] = evaluation
-
-            # Restore the winner's binary so downstream promotion code sees
-            # the correct compiled artefact, then clean up all backups.
-            winner_backup = winner_result.get("binary_backup")
-            if winner_backup and Path(winner_backup).exists():
-                shutil.copy2(str(winner_backup), str(binary_path))
-            for tr in tournament_results:
-                bk = tr.get("binary_backup")
-                if bk and Path(bk).exists():
-                    try:
-                        Path(bk).unlink()
-                    except OSError:
-                        pass
-
-            if evaluation.get("budget_exhausted"):
-                early_stop_reason = str(evaluation.get("reason") or "").strip() or _wall_budget_stop_reason(
-                    "candidate evaluation",
-                    remaining_seconds=_remaining_wall_seconds(deadline_monotonic),
-                )
-                attempt_record["stage"] = "deadline"
-                attempt_record["reason"] = early_stop_reason
-                attempts.append(attempt_record)
-                print(f"[cloud-tuning] early stop after attempt {attempt_index}: {early_stop_reason}", flush=True)
-                break
-
-        else:
-            # ── Single-provider path (original) ─────────────────────
-            # Two-phase model: switch model based on current tier objective.
-            _two_phase_env: dict[str, str] | None = None
-            _tp_overrides = _two_phase_model_env(
-                int(working_state["objective_priority_rank"])
-                if working_state.get("objective_priority_rank") is not None
-                else None
-            )
-            if _tp_overrides:
-                _two_phase_env = dict(os.environ)
-                _two_phase_env.update(_tp_overrides)
-                print(
-                    f"[cloud-tuning] two-phase model: using {_tp_overrides.get('VERTEX_MODEL_NAME', '?')} "
-                    f"for tier objective {working_state.get('objective_priority_rank')}",
-                    flush=True,
-                )
-
-            if retry_feedback or variant_lessons_text:
-                generate_cmd_base.extend(["--retry-feedback-file", str(retry_feedback_path)])
-            # Quick-retry: on generation failure, retry up to
-            # GENERATION_QUICK_RETRIES times within the same attempt before
-            # falling through to the next outer attempt.  This avoids burning
-            # a full compile+eval cycle on transient LLM failures (the dominant
-            # waste mode for lighter models).
-            _gen_ok = False
-            for _gen_retry_idx in range(1 + GENERATION_QUICK_RETRIES):
-                generate_proc = _run_logged(
-                    generate_cmd_base,
-                    run_dir / f"02_generate_attempt_{attempt_index}.json",
-                    cwd=FOLLY_EDIT_RAG_SCRIPTS,
-                    env=_two_phase_env,
-                )
-                attempt_record["generate"] = {"returncode": generate_proc.returncode}
-                gen_token_path = _PATCHES_DIR / f"{generated_name}.token_usage.json"
-                gen_token_usage = _read_token_usage_sidecar(gen_token_path)
-                attempt_record["generate"]["token_usage"] = gen_token_usage
-                _accumulate_token_usage(cumulative_token_usage, gen_token_usage)
-                if generate_proc.returncode == 0:
-                    _gen_ok = True
-                    break
-                if _gen_retry_idx < GENERATION_QUICK_RETRIES:
-                    print(
-                        f"[cloud-tuning] attempt {attempt_index} generation failed "
-                        f"(quick-retry {_gen_retry_idx + 1}/{GENERATION_QUICK_RETRIES})",
-                        flush=True,
-                    )
-            if not _gen_ok:
-                attempt_record["stage"] = "generate"
-                attempt_record["reason"] = "Generation step failed."
-                attempts.append(attempt_record)
-                retry_feedback = (
-                    f"Attempt {attempt_index} failed before patch generation completed. Produce a simpler, deterministic local patch."
-                )
-                continue
-
-            if compile_budget_s is not None and compile_budget_s < MIN_COMPILE_BUDGET_SECONDS:
-                early_stop_reason = _wall_budget_stop_reason(
-                    "compile/repair",
-                    remaining_seconds=_remaining_wall_seconds(deadline_monotonic),
-                    reserve_seconds=REQUEST_BUDGET_SLACK_SECONDS + MIN_EVALUATE_BUDGET_SECONDS,
-                )
-                attempt_record["stage"] = "deadline"
-                attempt_record["reason"] = early_stop_reason
-                attempts.append(attempt_record)
-                print(f"[cloud-tuning] early stop after attempt {attempt_index}: {early_stop_reason}", flush=True)
-                break
-
-            if compile_budget_s is not None:
-                compile_cmd_base.extend(["--wall-clock-budget-s", f"{compile_budget_s:.1f}"])
-            compile_proc = _run_logged(
-                compile_cmd_base,
-                run_dir / f"03_compile_attempt_{attempt_index}.json",
+        if retry_feedback or variant_lessons_text:
+            generate_cmd_base.extend(["--retry-feedback-file", str(retry_feedback_path)])
+        _gen_ok = False
+        for _gen_retry_idx in range(1 + GENERATION_QUICK_RETRIES):
+            generate_proc = _run_logged(
+                generate_cmd_base,
+                run_dir / f"02_generate_attempt_{attempt_index}.json",
                 cwd=FOLLY_EDIT_RAG_SCRIPTS,
                 env=_two_phase_env,
             )
-            attempt_record["compile"] = {"returncode": compile_proc.returncode}
-            compile_token_path = _COMPILE_LOGS_DIR / f"{attempt_id}.token_usage.json"
-            compile_token_usage = _read_token_usage_sidecar(compile_token_path)
-            attempt_record["compile"]["token_usage"] = compile_token_usage
-            _accumulate_token_usage(cumulative_token_usage, compile_token_usage)
-            compile_log = FOLLY_EDIT_RAG_SCRIPTS / "outputs" / "compile_logs" / f"{attempt_id}.json"
-            try:
-                compile_record = json.loads(compile_log.read_text(encoding="utf-8")) if compile_log.exists() else {}
-            except (json.JSONDecodeError, OSError):
-                compile_record = {}
-            last_compile_record = compile_record
-            attempt_record["compile_record"] = compile_record
-            if not compile_record.get("success"):
-                attempt_record["stage"] = "compile"
-                attempt_record["reason"] = "Compile/repair step did not produce a successful build."
-                failure_headline = _first_nonempty_line(
-                    "\n".join(
-                        part
-                        for part in (
-                            str(compile_record.get("second_patch_apply_summary", "")),
-                            str(compile_record.get("first_patch_apply_summary", "")),
-                            str(compile_record.get("second_compile_summary", "")),
-                            str(compile_record.get("first_compile_summary", "")),
-                        )
-                        if part.strip()
-                    )
-                )
-                if failure_headline:
-                    print(
-                        f"[cloud-tuning] attempt {attempt_index} failed while adjusting "
-                        f"{working_state['active_source_microbenchmark']}: {failure_headline}",
-                        flush=True,
-                    )
-                attempts.append(attempt_record)
-                retry_feedback = _build_attempt_retry_feedback(
-                    task_payload,
-                    attempt_index,
-                    objective_priority_rank=(
-                        int(working_state["objective_priority_rank"])
-                        if working_state.get("objective_priority_rank") is not None
-                        else None
-                    ),
-                    active_source_microbenchmark=str(working_state["active_source_microbenchmark"]),
-                    compile_record=compile_record,
-                    canonical_target=canonical_target,
-                )
-                continue
-
-            remaining_before_evaluation = _remaining_wall_seconds(deadline_monotonic)
-            if remaining_before_evaluation is not None and remaining_before_evaluation <= (
-                REQUEST_BUDGET_SLACK_SECONDS + MIN_EVALUATE_BUDGET_SECONDS
-            ):
-                early_stop_reason = _wall_budget_stop_reason(
-                    "candidate evaluation",
-                    remaining_seconds=remaining_before_evaluation,
-                    reserve_seconds=REQUEST_BUDGET_SLACK_SECONDS,
-                )
-                attempt_record["stage"] = "deadline"
-                attempt_record["reason"] = early_stop_reason
-                attempts.append(attempt_record)
-                print(f"[cloud-tuning] early stop after attempt {attempt_index} compile: {early_stop_reason}", flush=True)
+            attempt_record["generate"] = {"returncode": generate_proc.returncode}
+            gen_token_path = _PATCHES_DIR / f"{generated_name}.token_usage.json"
+            gen_token_usage = _read_token_usage_sidecar(gen_token_path)
+            attempt_record["generate"]["token_usage"] = gen_token_usage
+            _accumulate_token_usage(cumulative_token_usage, gen_token_usage)
+            if generate_proc.returncode == 0:
+                _gen_ok = True
                 break
+            if _gen_retry_idx < GENERATION_QUICK_RETRIES:
+                print(
+                    f"[cloud-tuning] attempt {attempt_index} generation failed "
+                    f"(quick-retry {_gen_retry_idx + 1}/{GENERATION_QUICK_RETRIES})",
+                    flush=True,
+                )
+        if not _gen_ok:
+            attempt_record["stage"] = "generate"
+            attempt_record["reason"] = "Generation step failed."
+            attempts.append(attempt_record)
+            retry_feedback = (
+                f"Attempt {attempt_index} failed before patch generation completed. Produce a simpler, deterministic local patch."
+            )
+            continue
 
-            evaluation = _evaluate_adjusted_binary(
-                run_dir=run_dir,
-                attempt_index=attempt_index,
-                binary_path=binary_path,
-                binary_name=binary_name,
-                source_microbenchmark=str(working_state["active_source_microbenchmark"]),
-                baseline_binary_microbenchmarks=baseline_binary_microbenchmarks,
-                canonical_target=canonical_target,
-                feature_scales=feature_scales,
-                anchor_features=dict(working_state["current_features"]),
-                anchor_constraint_report=_hardware_counter_constraint_report(
-                    canonical_target,
-                    dict(working_state["current_features"]),
-                ),
+        compile_budget_s = _available_step_budget_seconds(
+            deadline_monotonic,
+            reserve_seconds=REQUEST_BUDGET_SLACK_SECONDS + MIN_EVALUATE_BUDGET_SECONDS,
+        )
+        if compile_budget_s is not None and compile_budget_s < MIN_COMPILE_BUDGET_SECONDS:
+            early_stop_reason = _wall_budget_stop_reason(
+                "compile/repair",
+                remaining_seconds=_remaining_wall_seconds(deadline_monotonic),
+                reserve_seconds=REQUEST_BUDGET_SLACK_SECONDS + MIN_EVALUATE_BUDGET_SECONDS,
+            )
+            attempt_record["stage"] = "deadline"
+            attempt_record["reason"] = early_stop_reason
+            attempts.append(attempt_record)
+            print(f"[cloud-tuning] early stop after attempt {attempt_index}: {early_stop_reason}", flush=True)
+            break
+
+        if compile_budget_s is not None:
+            compile_cmd_base.extend(["--wall-clock-budget-s", f"{compile_budget_s:.1f}"])
+        compile_proc = _run_logged(
+            compile_cmd_base,
+            run_dir / f"03_compile_attempt_{attempt_index}.json",
+            cwd=FOLLY_EDIT_RAG_SCRIPTS,
+            env=_two_phase_env,
+        )
+        attempt_record["compile"] = {"returncode": compile_proc.returncode}
+        compile_token_path = _COMPILE_LOGS_DIR / f"{attempt_id}.token_usage.json"
+        compile_token_usage = _read_token_usage_sidecar(compile_token_path)
+        attempt_record["compile"]["token_usage"] = compile_token_usage
+        _accumulate_token_usage(cumulative_token_usage, compile_token_usage)
+        compile_log = FOLLY_EDIT_RAG_SCRIPTS / "outputs" / "compile_logs" / f"{attempt_id}.json"
+        try:
+            compile_record = json.loads(compile_log.read_text(encoding="utf-8")) if compile_log.exists() else {}
+        except (json.JSONDecodeError, OSError):
+            compile_record = {}
+        last_compile_record = compile_record
+        attempt_record["compile_record"] = compile_record
+        if not compile_record.get("success"):
+            attempt_record["stage"] = "compile"
+            attempt_record["reason"] = "Compile/repair step did not produce a successful build."
+            failure_headline = _first_nonempty_line(
+                "\n".join(
+                    part
+                    for part in (
+                        str(compile_record.get("second_patch_apply_summary", "")),
+                        str(compile_record.get("first_patch_apply_summary", "")),
+                        str(compile_record.get("second_compile_summary", "")),
+                        str(compile_record.get("first_compile_summary", "")),
+                    )
+                    if part.strip()
+                )
+            )
+            if failure_headline:
+                print(
+                    f"[cloud-tuning] attempt {attempt_index} failed while adjusting "
+                    f"{working_state['active_source_microbenchmark']}: {failure_headline}",
+                    flush=True,
+                )
+            attempts.append(attempt_record)
+            retry_feedback = _build_attempt_retry_feedback(
+                task_payload,
+                attempt_index,
                 objective_priority_rank=(
                     int(working_state["objective_priority_rank"])
                     if working_state.get("objective_priority_rank") is not None
                     else None
                 ),
-                perf_events=perf_events,
-                amd=amd,
-                deadline_monotonic=deadline_monotonic,
+                active_source_microbenchmark=str(working_state["active_source_microbenchmark"]),
                 compile_record=compile_record,
-                anchor_source_text=attempt_anchor_source_text,
-                ipc_coupled=ipc_coupled,
-                tier_stagnation_attempts=max(0, attempt_index - last_promotion_attempt),
+                canonical_target=canonical_target,
             )
-            last_evaluation = evaluation
-            attempt_record["evaluation"] = evaluation
-            if evaluation.get("budget_exhausted"):
-                early_stop_reason = str(evaluation.get("reason") or "").strip() or _wall_budget_stop_reason(
-                    "candidate evaluation",
-                    remaining_seconds=_remaining_wall_seconds(deadline_monotonic),
-                )
-                attempt_record["stage"] = "deadline"
-                attempt_record["reason"] = early_stop_reason
-                attempts.append(attempt_record)
-                print(f"[cloud-tuning] early stop after attempt {attempt_index}: {early_stop_reason}", flush=True)
-                break
+            continue
 
-        # ── Common post-evaluation (both tournament and single) ─────
+        remaining_before_evaluation = _remaining_wall_seconds(deadline_monotonic)
+        if remaining_before_evaluation is not None and remaining_before_evaluation <= (
+            REQUEST_BUDGET_SLACK_SECONDS + MIN_EVALUATE_BUDGET_SECONDS
+        ):
+            early_stop_reason = _wall_budget_stop_reason(
+                "candidate evaluation",
+                remaining_seconds=remaining_before_evaluation,
+                reserve_seconds=REQUEST_BUDGET_SLACK_SECONDS,
+            )
+            attempt_record["stage"] = "deadline"
+            attempt_record["reason"] = early_stop_reason
+            attempts.append(attempt_record)
+            print(f"[cloud-tuning] early stop after attempt {attempt_index} compile: {early_stop_reason}", flush=True)
+            break
+
+        evaluation = _evaluate_adjusted_binary(
+            run_dir=run_dir,
+            attempt_index=attempt_index,
+            binary_path=binary_path,
+            binary_name=binary_name,
+            source_microbenchmark=str(working_state["active_source_microbenchmark"]),
+            baseline_binary_microbenchmarks=baseline_binary_microbenchmarks,
+            canonical_target=canonical_target,
+            feature_scales=feature_scales,
+            anchor_features=dict(working_state["current_features"]),
+            anchor_constraint_report=_hardware_counter_constraint_report(
+                canonical_target,
+                dict(working_state["current_features"]),
+            ),
+            objective_priority_rank=(
+                int(working_state["objective_priority_rank"])
+                if working_state.get("objective_priority_rank") is not None
+                else None
+            ),
+            perf_events=perf_events,
+            amd=amd,
+            deadline_monotonic=deadline_monotonic,
+            compile_record=compile_record,
+            anchor_source_text=attempt_anchor_source_text,
+            ipc_coupled=ipc_coupled,
+            tier_stagnation_attempts=max(0, attempt_index - last_promotion_attempt),
+        )
+        last_evaluation = evaluation
+        attempt_record["evaluation"] = evaluation
+        if evaluation.get("budget_exhausted"):
+            early_stop_reason = str(evaluation.get("reason") or "").strip() or _wall_budget_stop_reason(
+                "candidate evaluation",
+                remaining_seconds=_remaining_wall_seconds(deadline_monotonic),
+            )
+            attempt_record["stage"] = "deadline"
+            attempt_record["reason"] = early_stop_reason
+            attempts.append(attempt_record)
+            print(f"[cloud-tuning] early stop after attempt {attempt_index}: {early_stop_reason}", flush=True)
+            break
+
         candidate = dict((evaluation.get("best_candidate") or {}).get("features") or {})
         candidate_error = evaluation.get("candidate_error")
         candidate_name = str((evaluation.get("best_candidate") or {}).get("microbenchmark") or "(unknown)")
@@ -5988,10 +5092,6 @@ def run_cloud_tuning_attempt(
             compile_record=compile_record,
             canonical_target=canonical_target,
         )
-        # When IPC-cache/branch coupled, only promote if the candidate beats
-        # the current working state on the coupled selection key.  Without
-        # this gate every selection-eligible candidate gets promoted, and the
-        # working state drifts away from the best-so-far code.
         if promoted_state is not None and ipc_coupled:
             candidate_feats = dict((evaluation.get("best_candidate") or {}).get("features") or {})
             ws_feats = dict(working_state.get("current_features") or {})
@@ -6058,11 +5158,6 @@ def run_cloud_tuning_attempt(
         else:
             attempt_record["working_state_promoted"] = False
 
-        # ── Tier escalation: advance past stagnant tiers ────────────────────
-        # If the optimizer has been stuck at the same tier for too long,
-        # forcibly advance to the next tier so lower-priority features
-        # (e.g., L1d, LLC, iTLB) get addressed even when upper tiers
-        # (e.g., L1i, branch) can't be perfectly matched.
         attempts_since_promotion = attempt_index - last_promotion_attempt
         current_obj_rank = working_state.get("objective_priority_rank")
         if (
@@ -6071,7 +5166,7 @@ def run_cloud_tuning_attempt(
             and current_obj_rank is not None
         ):
             try:
-                from cloning_priority import PRIORITY_ORDER
+                from scripts.cloning_priority import PRIORITY_ORDER
                 idx = PRIORITY_ORDER.index(int(current_obj_rank))
                 if idx + 1 < len(PRIORITY_ORDER):
                     next_rank = PRIORITY_ORDER[idx + 1]
@@ -6081,12 +5176,6 @@ def run_cloud_tuning_attempt(
                         f"{priority_tier_label(next_rank)}",
                         flush=True,
                     )
-                    # Snapshot the current tier before escalating (same as
-                    # natural tier advancement) so its features become
-                    # guardrails.  Since this is a forced escalation (tier was
-                    # NOT solved), pad the snapshot gaps by 10pp so the
-                    # regression guardrail doesn't block reasonable trade-offs
-                    # between upper-tier and lower-tier features.
                     _update_solved_tier_snapshot(
                         solved_tier_snapshot,
                         dict(working_state.get("current_features") or {}),
@@ -6159,7 +5248,6 @@ def run_cloud_tuning_attempt(
                 early_stop_reason = f"converged after PMU stagnation: {stagnation_reason}"
                 print(f"[cloud-tuning] {early_stop_reason}", flush=True)
                 break
-            # ── Variant stagnated: switch to a new variant instead of stopping ──
             _variant_gen_strategy = str(
                 working_state.get(
                     "initial_generation_mode",
@@ -6176,7 +5264,7 @@ def run_cloud_tuning_attempt(
                 stop_reason=stagnation_reason,
             )
             variant_history.append(lesson)
-            variant_lessons_text = "\n\n".join(v["lesson_text"] for v in variant_history)
+            variant_lessons_text = "\n\n".join(v["lesson_text"] for v in variant_history[-3:])
             print(
                 f"[cloud-tuning] variant {variant_index} stagnated after "
                 f"{variant_attempt_count} attempts. Switching to variant {variant_index + 1}.",
@@ -6246,9 +5334,6 @@ def run_cloud_tuning_attempt(
             evaluation=evaluation,
             canonical_target=canonical_target,
         )
-        # Append IPC-rejected tier hint if a candidate improved the active
-        # tier but was blocked by the IPC guardrail.  This lets the LLM
-        # reuse the tier-improving mechanism while focusing on IPC safety.
         ipc_hint = evaluation.get("ipc_rejected_tier_hint") if isinstance(evaluation, dict) else None
         if ipc_hint is not None:
             hint_name = str(ipc_hint.get("microbenchmark", "")).strip()
@@ -6325,8 +5410,6 @@ def run_cloud_tuning_attempt(
         "variant_count": variant_index,
         "variant_history": variant_history,
         "total_attempts": attempt_index,
-        "tournament_mode": TOURNAMENT_MODE,
-        "tournament_providers": TOURNAMENT_PROVIDERS if TOURNAMENT_MODE else [],
         "max_wall_seconds": max_wall_seconds,
         "elapsed_wall_seconds": time.monotonic() - started_at,
         "early_stop_reason": early_stop_reason or None,

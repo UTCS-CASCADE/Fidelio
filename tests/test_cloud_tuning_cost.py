@@ -7,10 +7,10 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import cloud_tuning
-import cloud_segment_frontend
+from scripts import cloud_segment_frontend
 from cloud_tuning import _estimated_llm_cost_usd
 
-sys.path.insert(0, str(Path(__file__).parent / "folly_edit_rag" / "scripts"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "folly_edit_rag" / "scripts"))
 from llm_provider import _vertex_token_usage
 
 
@@ -33,7 +33,7 @@ class EstimatedLlmCostTest(unittest.TestCase):
 
     def test_reads_provider_sidecars_from_scripts_outputs(self) -> None:
         expected = (
-            Path(__file__).parent
+            Path(__file__).resolve().parents[1]
             / "folly_edit_rag"
             / "scripts"
             / "outputs"

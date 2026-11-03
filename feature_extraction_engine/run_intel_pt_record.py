@@ -131,9 +131,6 @@ class FollyIntelPTRecorder:
                     line = line.strip()
                     if not line:
                         continue
-                    # Format: unit_name elapsed_seconds [command]
-                    # Unit names can contain spaces, so use greedy match to find the last float
-                    # Pattern: everything up to the last space-delimited float
                     m = re.match(r'^(.+)\s+([\d.]+)(?:\s+(.*))?$', line)
                     if m:
                         unit_name = m.group(1).strip()
@@ -151,12 +148,7 @@ class FollyIntelPTRecorder:
         return probe_times
 
     def save_probe_times(self, benchmark_name: str, probe_times: Dict[str, tuple]) -> Path:
-        """Save probe times and commands to disk as {bench_name}_probe_times.txt.
-        
-        probe_times should be dict of unit_name -> (elapsed_seconds, perfspect_command_str)
-        
-        Returns path to the saved file.
-        """
+        'Save probe times and commands to disk as {bench_name}_probe_times.txt. probe_times should be dict of unit_name -> (elapsed_seconds, perfspect_command_str) Returns path to the saved file.'
         if not probe_times:
             return None
         
@@ -220,13 +212,7 @@ class FollyIntelPTRecorder:
                         print(f"Discovered standalone binary: {name} -> {binary}")
 
     def run_benchmark_get_units(self, benchmark_binary: Path, is_standalone: bool = False) -> Tuple[Dict[str, float], Dict[str, tuple]]:
-        """Run the benchmark binary to extract unit names and throughput estimates.
-
-        Returns (units_dict, probe_times_dict) where:
-          - units_dict: mapping unit_name -> throughput (iters/sec)
-          - probe_times_dict: mapping unit_name -> (elapsed_seconds, command_str)
-        For standalone binaries, returns ({binary_name: 1e6}, {})
-        """
+        'Run the benchmark binary to extract unit names and throughput estimates.'
         # For standalone binaries, treat the whole binary as a single unit
         if is_standalone:
             return {benchmark_binary.name: 1e6}, {}
@@ -346,10 +332,6 @@ class FollyIntelPTRecorder:
 
     def _extract_units_from_text(self, text: str) -> Dict[str, float]:
         units = {}
-        # Common Google Benchmark / folly textual output often has columns like:
-        # <Name> <time/iter> <iters/s>
-        # Example: "BinaryProtocol_write_Empty                                  5.96ns   167.85M"
-        # First try to match that specific two-/three-column layout.
         col_pattern = re.compile(r'^\s*(?P<name>\S+)\s+(?P<time>[\d\.]+)\s*(?P<time_unit>ns|us|ms|s)?\s+(?P<iters>[\d\.,]+)\s*(?P<mult>[KMGTP]?)\b', re.IGNORECASE)
 
         # Fallback flexible pattern (older heuristic)
@@ -410,7 +392,6 @@ class FollyIntelPTRecorder:
         binary_out_dir.mkdir(parents=True, exist_ok=True)
 
         perf_data_file = binary_out_dir / f"{benchmark_name}_{safe_unit_name}_pt.data"
-        bench_out_file = binary_out_dir / f"{benchmark_name}_{safe_unit_name}_bench.txt"
         
         # Check if already completed (output file exists)
         if perf_data_file.exists():
@@ -603,7 +584,7 @@ class FollyIntelPTRecorder:
                 probe_file = self.save_probe_times(name, probe_times_dict)
                 print(f"  Saved probe times to {probe_file.name}")
         
-        print(f"\n=== Summary ===")
+        print("\n=== Summary ===")
         print(f"Total work items: {total_work}")
         print(f"Already completed: {skipped_count}")
         print(f"Failed in this run: {failed_count}")
@@ -617,23 +598,7 @@ def run_single_cmd_intel_pt(
     feature_window_s: Optional[float] = None,
     target_pid: Optional[int] = None,
 ):
-    """Run Intel PT recording on a single command, disassemble, and compute trace metrics.
-    
-    This function:
-      1. Records an Intel PT trace while running the given command
-      2. Disassembles the trace using perf script
-      3. Computes instruction trace statistics (block sizes, jumps, branch runs,
-         RAW dependency distances, instruction family distributions)
-      4. Returns a flat dict of percentile metrics suitable for the feature extraction JSON
-    
-    Args:
-        cmd_list: List of strings representing the command to run.
-        output_dir: Optional directory to save intermediate files.
-    
-    Returns:
-        Dict of metric_name -> value, e.g.:
-          {"block_size_P50": 5, "family::arith_P50": 1, ...}
-    """
+    'Run Intel PT recording on a single command, disassemble, and compute trace metrics.'
     import numpy as np
     
     # Import trace analysis functions from frequencies.py  
@@ -720,9 +685,6 @@ def run_single_cmd_intel_pt(
     
     try:
         start = time.time()
-        # Safety timeout: recording duration + generous flush budget.
-        # For system-wide (-a) the data file can be very large so give 90 s of
-        # post-recording flush time; for -p (target_pid) 60 s is ample.
         flush_budget = 60 if target_pid is not None else 90
         perf_timeout_s = int(max(120, warmup_s + window_s + flush_budget))
         result = subprocess.run(
@@ -784,19 +746,10 @@ def run_single_cmd_intel_pt(
                     print(f"[Intel PT] stderr: {proc.stderr[:500]}")
                 return {}
         
-        # Count lines in the output file
-        line_count = 0
-        if dis_file.exists():
-            with open(dis_file, 'r') as f:
-                for _ in f:
-                    line_count += 1
-        
-        if line_count == 0:
+        if not dis_file.exists() or dis_file.stat().st_size == 0:
             print("[Intel PT] No instruction lines produced")
             return {}
-        
-        print(f"[Intel PT] Disassembled {line_count} instruction lines")
-        
+
     except subprocess.TimeoutExpired:
         # Python 30s safety net fired; still try to use whatever was written
         if dis_file.exists() and dis_file.stat().st_size > 0:
@@ -809,9 +762,9 @@ def run_single_cmd_intel_pt(
         return {}
     
     # Step 3: Parse trace and compute statistics
-    print(f"[Intel PT] Computing trace statistics...")
+    print("[Intel PT] Computing trace statistics...")
     try:
-        instrs, _fam_counts = freq_mod.parse_trace(str(dis_file))
+        instrs, _fam_counts = freq_mod.parse_trace(str(dis_file), count_families=False)
         
         if not instrs:
             print("[Intel PT] No instructions parsed from trace")

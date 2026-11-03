@@ -9,10 +9,6 @@ from typing import Any
 EPSILON = 1e-9
 PRIORITY_ORDER = (1, 2, 3, 4)
 
-# Default selection of which prioritization profile to use. The historical
-# behavior is the frontend-bound hierarchy, so it remains the default. Select an
-# alternative profile by exporting CLONE_PRIORITY_MODE (e.g. "backend") or by
-# calling set_priority_mode() programmatically.
 DEFAULT_PRIORITY_MODE = "frontend"
 _PRIORITY_MODE_ENV = "CLONE_PRIORITY_MODE"
 _PRIORITY_MODE_OVERRIDE: str | None = None
@@ -27,10 +23,6 @@ class FeatureConstraint:
     importance_weight: float
 
 
-# ---------------------------------------------------------------------------
-# Frontend-bound profile (default / historical behavior).
-# Tiers: T0 IPC, T1 frontend, T2 branch/data cache, T3 iTLB/top-down.
-# ---------------------------------------------------------------------------
 _FRONTEND_TIER_LABELS = {
     1: "Tier T0 IPC",
     2: "Tier T1 frontend",
@@ -140,15 +132,6 @@ _FRONTEND_CONSTRAINTS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Backend-bound profile.
-# Tiers mirror the backend top-down (TMA) drill-down hierarchy:
-#   T0: IPC, tma_memory_bound, tma_core_bound
-#   T1: L1-dcache-load-misses MPKI, tma_dram_bound, tma_l1/l2/l3_bound
-#   T2: dTLB-load-misses MPKI, LLC-load-misses MPKI
-# IPC stays the tightest/primary signal and must not be sacrificed to match
-# lower tiers.
-# ---------------------------------------------------------------------------
 _BACKEND_TIER_LABELS = {
     1: "Tier T0 IPC/memory-core bound",
     2: "Tier T1 cache bound (L1d MPKI, DRAM/L1/L2/L3 bound)",
@@ -156,7 +139,6 @@ _BACKEND_TIER_LABELS = {
 }
 
 _BACKEND_CONSTRAINTS = {
-    # --- T0 ---
     "perf_stat.IPC": FeatureConstraint(
         feature_name="perf_stat.IPC",
         group="ipc",
@@ -178,7 +160,6 @@ _BACKEND_CONSTRAINTS = {
         tolerance_ratio=0.10,
         importance_weight=0.7,
     ),
-    # --- T1 ---
     "perf_stat.L1-dcache-load-misses_MPKI": FeatureConstraint(
         feature_name="perf_stat.L1-dcache-load-misses_MPKI",
         group="data",
@@ -214,7 +195,6 @@ _BACKEND_CONSTRAINTS = {
         tolerance_ratio=0.15,
         importance_weight=0.6,
     ),
-    # --- T2 ---
     "perf_stat.dTLB-load-misses_MPKI": FeatureConstraint(
         feature_name="perf_stat.dTLB-load-misses_MPKI",
         group="tlb_footprint",
