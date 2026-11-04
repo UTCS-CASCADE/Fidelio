@@ -1,7 +1,7 @@
 # Fidelio
 
-Counter-matching implementation from "Fidelio: Agentic AI Framework for
-Synthesizing Microarchitecture-Faithful Datacenter Benchmarks". The workflow
+Counter matching implementation from "Fidelio: Agentic AI Framework for
+Synthesizing Microarchitecture-Faithful Datacenter Benchmarks" (MICRO 2026). The workflow
 profiles a workload, selects an editable microbenchmark by IPC, retrieves editing
 context, generates and compiles changes, and measures candidates against the
 target counters.
